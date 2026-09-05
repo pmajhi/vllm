@@ -6,6 +6,11 @@
 This module defines the page-capacity contract for each quantizer ID. It does
 not change scheduler allocation or attention-kernel behavior; callers must use
 the same policy before activating a non-default layout end to end.
+
+Non-default layouts cannot share the baseline attention path: current V1
+backends select one cache shape and one physical block size for an execution
+batch. A non-default layout therefore requires either isolated execution with
+a matching backend or a backend that explicitly supports mixed page layouts.
 """
 
 from dataclasses import dataclass
