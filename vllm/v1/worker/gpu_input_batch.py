@@ -24,6 +24,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.worker.quantized_kv_layout import tokens_per_page_for_quantizer
 
 
 @dataclass
@@ -343,17 +344,15 @@ class InputBatch:
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
 
         # Experimental per-sequence fixed-byte-page geometry.
-        # Existing callers do not yet populate these attributes, so defaults
-        # preserve the current global block-size behavior.
-        self.quantizer_id_cpu[req_index] = request.quantizer_id
-        self.tokens_per_page_cpu[req_index] = getattr(
-            request,
-            "tokens_per_page",
-            self.block_table[0].block_size,
+        # Capacity is derived only from the registered quantizer policy.
+        quantizer_id = request.quantizer_id
+        self.quantizer_id_cpu[req_index] = quantizer_id
+        self.tokens_per_page_cpu[req_index] = (
+            tokens_per_page_for_quantizer(
+                quantizer_id,
+                self.block_table[0].block_size,
+            )
         )
-
-        if self.tokens_per_page_cpu[req_index] <= 0:
-            raise ValueError("tokens_per_page must be positive")
 
         self.block_table.add_row(request.block_ids, req_index)
 
