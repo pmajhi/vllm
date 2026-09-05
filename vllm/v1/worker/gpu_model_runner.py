@@ -498,6 +498,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                quantizer_id=new_req_data.quantizer_id,
             )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)

@@ -32,6 +32,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
+    quantizer_id: int = 0
 
     @classmethod
     def from_request(
@@ -50,6 +51,7 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            quantizer_id=request.quantizer_id,
         )
 
     def __repr__(self):

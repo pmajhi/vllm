@@ -45,6 +45,7 @@ class CachedRequestState:
     mrope_position_delta: Optional[int] = None
 
     lora_request: Optional[LoRARequest] = None
+    quantizer_id: int = 0
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -344,7 +345,7 @@ class InputBatch:
         # Experimental per-sequence fixed-byte-page geometry.
         # Existing callers do not yet populate these attributes, so defaults
         # preserve the current global block-size behavior.
-        self.quantizer_id_cpu[req_index] = getattr(request, "quantizer_id", 0)
+        self.quantizer_id_cpu[req_index] = request.quantizer_id
         self.tokens_per_page_cpu[req_index] = getattr(
             request,
             "tokens_per_page",

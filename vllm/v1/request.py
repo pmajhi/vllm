@@ -40,10 +40,12 @@ class Request:
         priority: int = 0,
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
+        quantizer_id: int = 0,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        self.quantizer_id = quantizer_id
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         # Because of LoRA, the eos token id can be different for each request.
