@@ -97,6 +97,52 @@ class BlockTable:
                block_offsets,
                out=self.slot_mapping_np[:req_indices.shape[0]])
 
+    def compute_quantized_mapping(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        tokens_per_page_by_request: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map tokens to fixed-byte physical pages and codec-local offsets.
+
+        This experimental path deliberately does not replace
+        ``compute_slot_mapping``. Standard vLLM attention uses one flat
+        token-slot ID based on one global block size. Quantized pages instead
+        retain a physical-page ID and a format-specific offset separately.
+        """
+        if req_indices.shape != positions.shape:
+            raise ValueError("req_indices and positions must have same shape")
+
+        if tokens_per_page_by_request.shape != (self.max_num_reqs,):
+            raise ValueError(
+                "tokens_per_page_by_request must have shape "
+                f"({self.max_num_reqs},)"
+            )
+
+        tokens_per_page = tokens_per_page_by_request[req_indices]
+
+        if np.any(tokens_per_page <= 0):
+            raise ValueError(
+                "Every active request must have positive tokens_per_page."
+            )
+
+        logical_page_indices = positions // tokens_per_page
+
+        if np.any(logical_page_indices >= self.max_num_blocks_per_req):
+            raise ValueError(
+                "A logical page index exceeds BlockTable capacity."
+            )
+
+        block_table_indices = (
+            req_indices * self.max_num_blocks_per_req
+            + logical_page_indices
+        )
+
+        physical_page_ids = self.block_table_np.ravel()[block_table_indices]
+        page_offsets = positions % tokens_per_page
+
+        return physical_page_ids.copy(), page_offsets.copy()
+
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
                                           non_blocking=True)
@@ -156,6 +202,52 @@ class MultiGroupBlockTable:
                              positions: np.ndarray) -> None:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(req_indices, positions)
+
+    def compute_quantized_mapping(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        tokens_per_page_by_request: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map tokens to fixed-byte physical pages and codec-local offsets.
+
+        This experimental path deliberately does not replace
+        ``compute_slot_mapping``. Standard vLLM attention uses one flat
+        token-slot ID based on one global block size. Quantized pages instead
+        retain a physical-page ID and a format-specific offset separately.
+        """
+        if req_indices.shape != positions.shape:
+            raise ValueError("req_indices and positions must have same shape")
+
+        if tokens_per_page_by_request.shape != (self.max_num_reqs,):
+            raise ValueError(
+                "tokens_per_page_by_request must have shape "
+                f"({self.max_num_reqs},)"
+            )
+
+        tokens_per_page = tokens_per_page_by_request[req_indices]
+
+        if np.any(tokens_per_page <= 0):
+            raise ValueError(
+                "Every active request must have positive tokens_per_page."
+            )
+
+        logical_page_indices = positions // tokens_per_page
+
+        if np.any(logical_page_indices >= self.max_num_blocks_per_req):
+            raise ValueError(
+                "A logical page index exceeds BlockTable capacity."
+            )
+
+        block_table_indices = (
+            req_indices * self.max_num_blocks_per_req
+            + logical_page_indices
+        )
+
+        physical_page_ids = self.block_table_np.ravel()[block_table_indices]
+        page_offsets = positions % tokens_per_page
+
+        return physical_page_ids.copy(), page_offsets.copy()
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:

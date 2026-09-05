@@ -108,6 +108,36 @@ class InputBatch:
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+        # Experimental quantized fixed-byte KV-page metadata.
+        # CPU arrays are pinned so active request rows can be copied to GPU
+        # without blocking. Defaults preserve existing FP16 behavior.
+        self.quantizer_id_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.quantizer_id_cpu = self.quantizer_id_cpu_tensor.numpy()
+        self.quantizer_id_gpu = torch.zeros(
+            (max_num_reqs,),
+            device=device,
+            dtype=torch.int32,
+        )
+
+        self.tokens_per_page_cpu_tensor = torch.full(
+            (max_num_reqs,),
+            block_sizes[0],
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.tokens_per_page_cpu = self.tokens_per_page_cpu_tensor.numpy()
+        self.tokens_per_page_gpu = torch.full(
+            (max_num_reqs,),
+            block_sizes[0],
+            device=device,
+            dtype=torch.int32,
+        )
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs, ),
             device="cpu",
@@ -310,6 +340,20 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+
+        # Experimental per-sequence fixed-byte-page geometry.
+        # Existing callers do not yet populate these attributes, so defaults
+        # preserve the current global block-size behavior.
+        self.quantizer_id_cpu[req_index] = getattr(request, "quantizer_id", 0)
+        self.tokens_per_page_cpu[req_index] = getattr(
+            request,
+            "tokens_per_page",
+            self.block_table[0].block_size,
+        )
+
+        if self.tokens_per_page_cpu[req_index] <= 0:
+            raise ValueError("tokens_per_page must be positive")
+
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -509,6 +553,15 @@ class InputBatch:
                 self.allowed_token_ids_mask_cpu_tensor[i2] =\
                 self.allowed_token_ids_mask_cpu_tensor[i2], \
                     self.allowed_token_ids_mask_cpu_tensor[i1]
+        self.quantizer_id_cpu[i1], self.quantizer_id_cpu[i2] = (
+            self.quantizer_id_cpu[i2],
+            self.quantizer_id_cpu[i1],
+        )
+        self.tokens_per_page_cpu[i1], self.tokens_per_page_cpu[i2] = (
+            self.tokens_per_page_cpu[i2],
+            self.tokens_per_page_cpu[i1],
+        )
+
         self.block_table.swap_row(i1, i2)
 
     def condense(self) -> None:
@@ -583,6 +636,16 @@ class InputBatch:
                 last_req_index]
             self.num_computed_tokens_cpu[
                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
+            self.quantizer_id_cpu[empty_index] = self.quantizer_id_cpu[
+                last_req_index
+            ]
+            self.tokens_per_page_cpu[empty_index] = self.tokens_per_page_cpu[
+                last_req_index
+            ]
+
+            self.quantizer_id_cpu[last_req_index] = 0
+            self.tokens_per_page_cpu[last_req_index] = self.block_table[0].block_size
+
             self.block_table.move_row(last_req_index, empty_index)
             self.temperature_cpu[empty_index] = self.temperature_cpu[
                 last_req_index]
@@ -618,6 +681,22 @@ class InputBatch:
         # Trim lists to the batch size.
         del self._req_ids[num_reqs:]
         del self.req_output_token_ids[num_reqs:]
+
+    def commit_quantized_page_metadata(self, num_reqs: int) -> None:
+        """Copy active request geometry from pinned CPU buffers to GPU."""
+        if not 0 <= num_reqs <= self.max_num_reqs:
+            raise ValueError(
+                f"num_reqs must be in [0, {self.max_num_reqs}], got {num_reqs}"
+            )
+
+        self.quantizer_id_gpu[:num_reqs].copy_(
+            self.quantizer_id_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.tokens_per_page_gpu[:num_reqs].copy_(
+            self.tokens_per_page_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
 
     def refresh_metadata(self):
         """Apply any batch updates to sampling metadata."""
