@@ -100,6 +100,17 @@ else:
 logger = init_logger(__name__)
 
 
+def _require_baseline_quantizer_ids(
+    quantizer_ids: np.ndarray,
+) -> None:
+    """Reject quantized layouts until a matching attention backend exists."""
+    if np.any(quantizer_ids != 0):
+        raise NotImplementedError(
+            "Non-default quantizer_id requires a quantized KV-cache "
+            "attention backend"
+        )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def __init__(
@@ -751,10 +762,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            torch.from_numpy(token_indices),
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
 
+        # The current slot-mapping and KV-cache kernels address physical
+        # block_size-token pages. Non-default fixed-byte layouts require a
+        # dedicated cache representation and attention backend.
+        _require_baseline_quantizer_ids(
+            self.input_batch.quantizer_id_cpu[:num_reqs]
+        )
+
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
+        self.input_batch.commit_quantized_page_metadata(num_reqs)
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0

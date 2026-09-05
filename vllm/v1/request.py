@@ -152,6 +152,7 @@ class Request:
                     if request.sampling_params else None,
             cache_salt=request.cache_salt,
             priority=request.priority,
+            quantizer_id=request.quantizer_id,
             block_hasher=block_hasher,
         )
 

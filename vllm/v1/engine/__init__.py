@@ -69,6 +69,10 @@ class EngineCoreRequest(
     current_wave: int = 0
     priority: int = 0
 
+    # Experimental fixed-byte KV-page format selection.
+    # Nonzero IDs are not enabled for end-to-end execution yet.
+    quantizer_id: int = 0
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""

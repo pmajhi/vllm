@@ -5,12 +5,12 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
-from vllm.v1.worker.quantized_kv_layout import (
+from vllm.v1.quantized_kv_layout import (
     get_quantized_kv_page_layout,
     tokens_per_page_for_quantizer,
 )
-
+from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 @pytest.mark.parametrize(
     ("quantizer_id", "baseline_tokens_per_page", "expected_tokens_per_page"),
@@ -172,3 +172,23 @@ def test_multi_group_quantized_mapping_handles_no_cache_groups() -> None:
 
     assert page_ids_by_group == []
     assert offsets_by_group == []
+
+
+def test_experimental_quantized_page_metadata_commit() -> None:
+    input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=8,
+        block_sizes=[16],
+        is_pooling_model=False,
+        pin_memory=False,
+        device=torch.device("cpu"),
+    )
+
+    input_batch.quantizer_id_cpu[:2] = [0, 1]
+    input_batch.tokens_per_page_cpu[:2] = [16, 32]
+
+    input_batch.commit_quantized_page_metadata(num_reqs=2)
+
+    assert input_batch.quantizer_id_gpu[:2].tolist() == [0, 1]
+    assert input_batch.tokens_per_page_gpu[:2].tolist() == [16, 32]

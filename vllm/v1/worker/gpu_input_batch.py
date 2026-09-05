@@ -24,7 +24,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
-from vllm.v1.worker.quantized_kv_layout import tokens_per_page_for_quantizer
+from vllm.v1.quantized_kv_layout import tokens_per_page_for_quantizer
 
 
 @dataclass
