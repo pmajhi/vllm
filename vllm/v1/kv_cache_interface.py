@@ -180,6 +180,62 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
+class FixedByteQuantizedAttentionSpec(KVCacheSpec):
+    """Experimental KV-cache spec with one fixed physical byte page.
+
+    Every physical page has ``page_bytes`` bytes regardless of the quantizer
+    assigned to a request. Codec-specific token capacity is intentionally not
+    represented here: it is carried per request and interpreted only by an
+    attention backend that explicitly supports heterogeneous quantized pages.
+
+    This type is kept separate from ``AttentionSpec`` so standard V1 attention
+    backends cannot accidentally reinterpret fixed-byte encoded pages as their
+    regular [K/V, block, token, head, dim] cache layout.
+    """
+
+    page_bytes: int
+    num_kv_heads: int
+    head_size: int
+    dtype: torch.dtype
+    layout_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if self.page_bytes <= 0:
+            raise ValueError("page_bytes must be positive")
+        if self.num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
+        if self.head_size <= 0:
+            raise ValueError("head_size must be positive")
+        if self.layout_version <= 0:
+            raise ValueError("layout_version must be positive")
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.page_bytes
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+    @classmethod
+    def merge(
+        cls,
+        specs: list[Self],
+    ) -> Self:
+        if not specs:
+            raise ValueError("specs must not be empty")
+        first = specs[0]
+        if not all(spec == first for spec in specs[1:]):
+            raise ValueError(
+                "All layers in a fixed-byte quantized KV-cache group must "
+                "have identical page geometry"
+            )
+        return copy.deepcopy(first)
+
+
+@dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype]

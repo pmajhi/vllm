@@ -3021,6 +3021,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 is_pooling_model=self.is_pooling_model,
             )
 
+    @staticmethod
+    def allocate_fixed_byte_kv_page_pool(
+        *,
+        num_pages: int,
+        page_bytes: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Allocate a common fixed-byte KV-page pool for one cache group.
+
+        The pool is deliberately uint8: an experimental heterogeneous
+        quantized attention backend owns the interpretation of page bytes.
+        Standard V1 K/V cache backends must not consume this tensor.
+        """
+        if num_pages <= 0:
+            raise ValueError("num_pages must be positive")
+        if page_bytes <= 0:
+            raise ValueError("page_bytes must be positive")
+
+        return torch.zeros(
+            (num_pages, page_bytes),
+            dtype=torch.uint8,
+            device=device,
+        )
+
     def _allocate_kv_cache_tensors(
             self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
