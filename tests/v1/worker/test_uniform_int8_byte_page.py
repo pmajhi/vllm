@@ -124,3 +124,115 @@ def test_pool_rejects_invalid_addresses_and_shapes() -> None:
             key=torch.zeros(4),
             value=valid,
         )
+
+
+def test_byte_page_batch_round_trip_preserves_packed_order() -> None:
+    torch.manual_seed(1)
+    pool = UniformInt8BytePagePool(
+        num_pages=3,
+        page_bytes=4096,
+        num_kv_heads=2,
+        head_size=8,
+        device=torch.device("cpu"),
+    )
+    page_ids = torch.tensor([2, 0, 2, 1], dtype=torch.int64)
+    page_offsets = torch.tensor([1, 3, 2, 0], dtype=torch.int64)
+    keys = torch.randn(4, 2, 8)
+    values = torch.randn(4, 2, 8)
+
+    pool.write_batch(
+        physical_page_ids=page_ids,
+        page_offsets=page_offsets,
+        keys=keys,
+        values=values,
+    )
+    decoded_keys, decoded_values = pool.read_batch(
+        physical_page_ids=page_ids,
+        page_offsets=page_offsets,
+        dtype=torch.float32,
+    )
+
+    assert decoded_keys.shape == keys.shape
+    assert decoded_values.shape == values.shape
+    assert torch.allclose(decoded_keys, keys, atol=0.03, rtol=0.03)
+    assert torch.allclose(decoded_values, values, atol=0.03, rtol=0.03)
+
+
+def test_byte_page_batch_read_supports_empty_input() -> None:
+    pool = UniformInt8BytePagePool(
+        num_pages=1,
+        page_bytes=4096,
+        num_kv_heads=1,
+        head_size=4,
+        device=torch.device("cpu"),
+    )
+    empty_ids = torch.empty(0, dtype=torch.int64)
+    empty_offsets = torch.empty(0, dtype=torch.int64)
+
+    keys, values = pool.read_batch(
+        physical_page_ids=empty_ids,
+        page_offsets=empty_offsets,
+        dtype=torch.float16,
+    )
+
+    assert keys.shape == (0, 1, 4)
+    assert values.shape == (0, 1, 4)
+    assert keys.dtype is torch.float16
+    assert values.dtype is torch.float16
+
+
+@pytest.mark.parametrize(
+    ("page_ids", "page_offsets", "keys_shape", "values_shape", "message"),
+    [
+        (
+            torch.zeros((1, 1), dtype=torch.int64),
+            torch.zeros(1, dtype=torch.int64),
+            (1, 1, 4),
+            (1, 1, 4),
+            "physical_page_ids must be one-dimensional",
+        ),
+        (
+            torch.zeros(1, dtype=torch.int64),
+            torch.zeros(2, dtype=torch.int64),
+            (1, 1, 4),
+            (1, 1, 4),
+            "page_offsets must have the same shape",
+        ),
+        (
+            torch.zeros(1, dtype=torch.int64),
+            torch.zeros(1, dtype=torch.int64),
+            (1, 4),
+            (1, 1, 4),
+            "keys must have shape",
+        ),
+        (
+            torch.zeros(1, dtype=torch.int64),
+            torch.zeros(1, dtype=torch.int64),
+            (1, 1, 4),
+            (1, 4),
+            "values must have shape",
+        ),
+    ],
+)
+def test_byte_page_batch_write_rejects_invalid_shapes(
+    page_ids: torch.Tensor,
+    page_offsets: torch.Tensor,
+    keys_shape: tuple[int, ...],
+    values_shape: tuple[int, ...],
+    message: str,
+) -> None:
+    pool = UniformInt8BytePagePool(
+        num_pages=1,
+        page_bytes=4096,
+        num_kv_heads=1,
+        head_size=4,
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        pool.write_batch(
+            physical_page_ids=page_ids,
+            page_offsets=page_offsets,
+            keys=torch.zeros(keys_shape),
+            values=torch.zeros(values_shape),
+        )

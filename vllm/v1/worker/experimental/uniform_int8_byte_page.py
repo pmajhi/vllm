@@ -296,3 +296,99 @@ class UniformInt8BytePagePool:
             dequantize_symmetric_int8(quantized_key, key_scale, dtype),
             dequantize_symmetric_int8(quantized_value, value_scale, dtype),
         )
+
+    def write_batch(
+        self,
+        *,
+        physical_page_ids: torch.Tensor,
+        page_offsets: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Quantize and write packed K/V tokens to fixed-byte pages."""
+        if physical_page_ids.ndim != 1:
+            raise ValueError("physical_page_ids must be one-dimensional")
+        if page_offsets.shape != physical_page_ids.shape:
+            raise ValueError(
+                "page_offsets must have the same shape as physical_page_ids"
+            )
+
+        num_tokens = physical_page_ids.numel()
+        expected_shape = (
+            num_tokens,
+            self.layout.num_kv_heads,
+            self.layout.head_size,
+        )
+        if tuple(keys.shape) != expected_shape:
+            raise ValueError(
+                f"keys must have shape {expected_shape}, got {tuple(keys.shape)}"
+            )
+        if tuple(values.shape) != expected_shape:
+            raise ValueError(
+                f"values must have shape {expected_shape}, "
+                f"got {tuple(values.shape)}"
+            )
+        if physical_page_ids.device != self.device:
+            raise ValueError(
+                "physical_page_ids must be on the page-pool device"
+            )
+        if page_offsets.device != self.device:
+            raise ValueError("page_offsets must be on the page-pool device")
+        if keys.device != self.device or values.device != self.device:
+            raise ValueError("keys and values must be on the page-pool device")
+
+        for token_index in range(num_tokens):
+            self.write(
+                page_id=int(physical_page_ids[token_index]),
+                page_offset=int(page_offsets[token_index]),
+                key=keys[token_index],
+                value=values[token_index],
+            )
+
+    def read_batch(
+        self,
+        *,
+        physical_page_ids: torch.Tensor,
+        page_offsets: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read packed K/V tokens from fixed-byte pages in input order."""
+        if physical_page_ids.ndim != 1:
+            raise ValueError("physical_page_ids must be one-dimensional")
+        if page_offsets.shape != physical_page_ids.shape:
+            raise ValueError(
+                "page_offsets must have the same shape as physical_page_ids"
+            )
+        if physical_page_ids.device != self.device:
+            raise ValueError(
+                "physical_page_ids must be on the page-pool device"
+            )
+        if page_offsets.device != self.device:
+            raise ValueError("page_offsets must be on the page-pool device")
+
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+
+        for token_index in range(physical_page_ids.numel()):
+            key, value = self.read(
+                page_id=int(physical_page_ids[token_index]),
+                page_offset=int(page_offsets[token_index]),
+                dtype=dtype,
+            )
+            keys.append(key)
+            values.append(value)
+
+        expected_shape = (
+            0,
+            self.layout.num_kv_heads,
+            self.layout.head_size,
+        )
+        if not keys:
+            empty = torch.empty(
+                expected_shape,
+                dtype=dtype,
+                device=self.device,
+            )
+            return empty, empty.clone()
+
+        return torch.stack(keys), torch.stack(values)
