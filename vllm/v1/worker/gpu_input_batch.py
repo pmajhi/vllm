@@ -24,6 +24,13 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.worker.experimental.hetero_kv_codec_registry import (
+    HeteroKVCodecId,
+    resolve_hetero_kv_codec_plan,
+)
+from vllm.v1.worker.experimental.hetero_kv_page_config import (
+    get_hetero_kv_page_bytes,
+)
 from vllm.v1.quantized_kv_layout import (
     get_quantized_kv_page_layout,
     tokens_per_page_for_quantizer,
@@ -95,6 +102,9 @@ class InputBatch:
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        # Installed after the runner has inspected actual AttentionSpec
+        # geometry. None preserves baseline-safe early initialization.
+        self._hetero_kv_tokens_per_page_by_codec: dict[int, int] | None = None
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -309,6 +319,59 @@ class InputBatch:
              request.output_token_ids))
         return new_req_index
 
+    def configure_hetero_kv_page_planning(
+        self,
+        *,
+        num_kv_heads: int,
+        head_size: int,
+        page_bytes: int | None = None,
+    ) -> None:
+        """Install registry-derived capacities for nonbaseline codecs.
+
+        This must run only after the runner has inspected actual attention
+        geometry. Quantizer ID 0 intentionally retains VLLM's normal
+        block-size-based capacity.
+        """
+        if page_bytes is None:
+            page_bytes = get_hetero_kv_page_bytes()
+
+        self._hetero_kv_tokens_per_page_by_codec = {
+            int(codec_id): resolve_hetero_kv_codec_plan(
+                codec_id=codec_id,
+                page_bytes=page_bytes,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+            ).tokens_per_page
+            for codec_id in HeteroKVCodecId
+            if codec_id is not HeteroKVCodecId.BASELINE
+        }
+
+    def _tokens_per_page_for_request(
+        self,
+        *,
+        quantizer_id: int,
+        physical_page_bytes: int,
+    ) -> int:
+        """Return the logical capacity for one request's selected codec."""
+        if quantizer_id == HeteroKVCodecId.BASELINE:
+            return tokens_per_page_for_quantizer(
+                quantizer_id,
+                physical_page_bytes,
+            )
+
+        if self._hetero_kv_tokens_per_page_by_codec is None:
+            raise RuntimeError(
+                "Experimental heterogeneous KV planning has not been "
+                "configured with model attention geometry."
+            )
+
+        try:
+            return self._hetero_kv_tokens_per_page_by_codec[quantizer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported heterogeneous KV codec ID: {quantizer_id}"
+            ) from exc
+
     def add_request(
         self,
         request: "CachedRequestState",
@@ -356,9 +419,9 @@ class InputBatch:
             * baseline_layout.bytes_per_token
         )
         self.tokens_per_page_cpu[req_index] = (
-            tokens_per_page_for_quantizer(
-                quantizer_id,
-                physical_page_bytes,
+            self._tokens_per_page_for_request(
+                quantizer_id=quantizer_id,
+                physical_page_bytes=physical_page_bytes,
             )
         )
 
