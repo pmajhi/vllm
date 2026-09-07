@@ -229,3 +229,63 @@ def test_int8_paged_kv_cache_attention_runs_on_cuda() -> None:
         atol=0.05,
     )
     assert int8_output.device.type == "cuda"
+
+def test_int8_paged_kv_cache_rejects_duplicate_batch_addresses() -> None:
+    cache = Int8PagedKVCache(
+        num_physical_pages=2,
+        tokens_per_page=2,
+        num_kv_heads=1,
+        head_size=4,
+        device=torch.device("cpu"),
+    )
+
+    page_ids = torch.tensor([0, 0], dtype=torch.int32)
+    page_offsets = torch.tensor([1, 1], dtype=torch.int32)
+    keys = torch.zeros(2, 1, 4)
+    values = torch.zeros(2, 1, 4)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        cache.write_batch(page_ids, page_offsets, keys, values)
+
+@pytest.mark.parametrize(
+    ("page_ids", "page_offsets", "error_message"),
+    [
+        (
+            torch.tensor([-1], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            "physical_page_ids must be nonnegative",
+        ),
+        (
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            "physical_page_ids exceed cache capacity",
+        ),
+        (
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+            "page_offsets must be nonnegative",
+        ),
+        (
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            "page_offsets exceed page capacity",
+        ),
+    ],
+)
+def test_int8_paged_kv_cache_rejects_invalid_batch_addresses(
+    page_ids: torch.Tensor,
+    page_offsets: torch.Tensor,
+    error_message: str,
+) -> None:
+    cache = Int8PagedKVCache(
+        num_physical_pages=2,
+        tokens_per_page=2,
+        num_kv_heads=1,
+        head_size=4,
+        device=torch.device("cpu"),
+    )
+    keys = torch.zeros(1, 1, 4)
+    values = torch.zeros(1, 1, 4)
+
+    with pytest.raises(IndexError, match=error_message):
+        cache.write_batch(page_ids, page_offsets, keys, values)
