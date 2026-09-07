@@ -299,7 +299,8 @@ def test_int8_paged_kv_cache_uses_injected_codec() -> None:
 
     codec = Mock()
     codec.storage_dtype = torch.int8
-    codec.metadata_shape = (1,)
+    codec.key_metadata_shape.return_value = (1, 1)
+    codec.value_metadata_shape.return_value = (1, 1)
     codec.encode.return_value = (
         encoded_key,
         encoded_value,
@@ -330,7 +331,8 @@ def test_int8_paged_kv_cache_uses_injected_codec() -> None:
 def test_int8_paged_kv_cache_uses_codec_storage_description() -> None:
     codec = Mock()
     codec.storage_dtype = torch.uint8
-    codec.metadata_shape = (2,)
+    codec.key_metadata_shape.return_value = (2, 2)
+    codec.value_metadata_shape.return_value = (2, 2)
 
     cache = Int8PagedKVCache(
         num_physical_pages=3,

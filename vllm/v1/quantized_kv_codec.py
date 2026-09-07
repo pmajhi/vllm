@@ -24,10 +24,22 @@ class QuantizedKVCodec(ABC):
     codec_id: int
     name: str
 
-    @property
     @abstractmethod
-    def metadata_shape(self) -> tuple[int, ...]:
-        """Shape of metadata stored for one K or V token."""
+    def key_metadata_shape(
+        self,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, ...]:
+        """Metadata shape for one stored key token."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def value_metadata_shape(
+        self,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, ...]:
+        """Metadata shape for one stored value token."""
         raise NotImplementedError
     
     @property

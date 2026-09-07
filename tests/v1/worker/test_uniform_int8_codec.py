@@ -82,4 +82,5 @@ def test_uniform_int8_codec_describes_its_storage() -> None:
     codec = UniformInt8KVCodec()
 
     assert codec.storage_dtype is torch.int8
-    assert codec.metadata_shape == (1,)
+    assert codec.key_metadata_shape(2, 8) == (2, 1)
+    assert codec.value_metadata_shape(2, 8) == (2, 1)

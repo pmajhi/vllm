@@ -16,9 +16,19 @@ class UniformInt8KVCodec(QuantizedKVCodec):
     codec_id = 1
     name = "uniform_int8"
 
-    @property
-    def metadata_shape(self) -> tuple[int, ...]:
-        return (1,)
+    def key_metadata_shape(
+        self,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, ...]:
+        return (num_kv_heads, 1)
+
+    def value_metadata_shape(
+        self,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, ...]:
+        return (num_kv_heads, 1)
 
     @property
     def storage_dtype(self) -> torch.dtype:

@@ -37,30 +37,21 @@ class Int8PagedKVCache:
         self.head_size = head_size
         self.codec = codec if codec is not None else UniformInt8KVCodec()
 
-        kv_shape = (
-            num_physical_pages,
-            tokens_per_page,
-            num_kv_heads,
-            head_size,
-        )
-        scale_shape = (
-            num_physical_pages,
-            tokens_per_page,
-            num_kv_heads,
-            1,
-        )
-
         payload_shape = (
             num_physical_pages,
             tokens_per_page,
             num_kv_heads,
             head_size,
         )
-        metadata_shape = (
+        key_metadata_shape = (
             num_physical_pages,
             tokens_per_page,
-            num_kv_heads,
-            *self.codec.metadata_shape,
+            *self.codec.key_metadata_shape(num_kv_heads, head_size),
+        )
+        value_metadata_shape = (
+            num_physical_pages,
+            tokens_per_page,
+            *self.codec.value_metadata_shape(num_kv_heads, head_size),
         )
 
         self.keys = torch.empty(
@@ -74,12 +65,12 @@ class Int8PagedKVCache:
             device=device,
         )
         self.key_scales = torch.empty(
-            metadata_shape,
+            key_metadata_shape,
             dtype=torch.float32,
             device=device,
         )
         self.value_scales = torch.empty(
-            metadata_shape,
+            value_metadata_shape,
             dtype=torch.float32,
             device=device,
         )
