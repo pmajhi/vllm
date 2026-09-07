@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -140,6 +140,19 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # Experimental heterogeneous fixed-byte KV-page mapping. These tensors are
+    # metadata only; the standard FlashAttention path does not consume them.
+    quantizer_id: torch.Tensor | None = None
+    tokens_per_page: torch.Tensor | None = None
+    quantized_page_ids: torch.Tensor | None = None
+    quantized_page_offsets: torch.Tensor | None = None
+
+    # Reference-only callback for experimental KV shadow storage. This remains
+    # None in the normal execution path and must not run under CUDA graphs.
+    cachegen_int8_shadow_write: Optional[
+        Callable[[torch.Tensor, torch.Tensor, "FlashAttentionMetadata"], None]
+    ] = None
+
 
 def _get_sliding_window_configs(
         vllm_config: VllmConfig) -> set[Optional[tuple[int, int]]]:
@@ -240,6 +253,10 @@ class FlashAttentionMetadataBuilder(
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+        quantizer_id = common_attn_metadata.quantizer_id
+        tokens_per_page = common_attn_metadata.tokens_per_page
+        quantized_page_ids = common_attn_metadata.quantized_page_ids
+        quantized_page_offsets = common_attn_metadata.quantized_page_offsets
 
         # the overhead of the aot schedule is not worth it for spec-decode
         aot_schedule = self.aot_schedule and not fast_build
@@ -358,11 +375,47 @@ class FlashAttentionMetadataBuilder(
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
+            quantizer_id=quantizer_id,
+            tokens_per_page=tokens_per_page,
+            quantized_page_ids=quantized_page_ids,
+            quantized_page_offsets=quantized_page_offsets,
             causal=causal)
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         return use_cascade_attention(*args, **kwargs)
+
+
+def _run_cachegen_int8_shadow_write(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: FlashAttentionMetadata,
+) -> None:
+    """Run an optional reference CacheGen-style KV shadow write.
+
+    The standard FlashAttention cache path does not depend on this helper.
+    Callers attach the callback only in eager diagnostic runs; it is not
+    CUDA-graph safe because the reference implementation may perform
+    per-token Python dispatch.
+    """
+    callback = attn_metadata.cachegen_int8_shadow_write
+    if callback is None:
+        return
+    if attn_metadata.quantized_page_ids is None:
+        raise AssertionError(
+            "CacheGen shadow write requires quantized page IDs"
+        )
+    if attn_metadata.quantized_page_offsets is None:
+        raise AssertionError(
+            "CacheGen shadow write requires quantized page offsets"
+        )
+    num_actual_tokens = attn_metadata.num_actual_tokens
+    callback(
+        key[:num_actual_tokens],
+        value[:num_actual_tokens],
+        attn_metadata,
+    )
 
 
 class FlashAttentionImpl(AttentionImpl):
@@ -488,6 +541,12 @@ class FlashAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
+
+        _run_cachegen_int8_shadow_write(
+            key=key,
+            value=value,
+            attn_metadata=attn_metadata,
+        )
 
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.

@@ -78,9 +78,13 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
     CacheGenInt8FixedBytePageAdapter,
+    write_cachegen_int8_mapped_tokens,
 )
 from vllm.v1.worker.experimental.cachegen_int8_page_adapter_config import (
     is_cachegen_int8_page_adapter_enabled,
+)
+from vllm.v1.worker.experimental.cachegen_int8_shadow_write_config import (
+    is_cachegen_int8_shadow_write_enabled,
 )
 from vllm.v1.worker.experimental.hetero_kv_page_config import (
     get_hetero_kv_page_bytes,
@@ -117,12 +121,18 @@ logger = init_logger(__name__)
 def _require_baseline_quantizer_ids(
     quantizer_ids: np.ndarray,
 ) -> None:
-    """Reject quantized layouts until a matching attention backend exists."""
-    if np.any(quantizer_ids != 0):
-        raise NotImplementedError(
-            "Non-default quantizer_id requires a quantized KV-cache "
-            "attention backend"
-        )
+    """Reject nonbaseline execution except the explicit CacheGen shadow mode."""
+    if np.all(quantizer_ids == 0):
+        return
+
+    if is_cachegen_int8_shadow_write_enabled() and np.all(
+            quantizer_ids == 2):
+        return
+
+    raise NotImplementedError(
+        "Non-default quantizer_id requires a quantized KV-cache "
+        "attention backend"
+    )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -965,6 +975,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                 ))
+                self._attach_cachegen_int8_shadow_write(
+                    attn_metadata=attn_metadata_i,
+                )
 
                 fast_prefill_metadata = attn_metadata_i
                 if (self.cache_config.kv_sharing_fast_prefill
@@ -3063,6 +3076,105 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             (num_pages, page_bytes),
             dtype=torch.uint8,
             device=device,
+        )
+
+    def _attach_cachegen_int8_shadow_write(
+        self,
+        *,
+        attn_metadata: Any,
+    ) -> None:
+        """Attach an eager-only CacheGen-style K/V shadow-write callback."""
+        if not is_cachegen_int8_shadow_write_enabled():
+            return
+
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "CacheGen-style KV shadow write requires "
+                "cudagraph_mode=NONE"
+            )
+        if self.cachegen_int8_page_adapter is None:
+            raise AssertionError(
+                "CacheGen-style KV shadow write requires the page adapter"
+            )
+        if not hasattr(attn_metadata, "cachegen_int8_shadow_write"):
+            return
+        if attn_metadata.quantizer_id is None:
+            raise AssertionError(
+                "CacheGen-style KV shadow write requires quantizer IDs"
+            )
+        if torch.any(attn_metadata.quantizer_id != 2):
+            raise ValueError(
+                "CacheGen-style KV shadow write currently requires every "
+                "active request to use quantizer_id=2"
+            )
+
+        def shadow_write(
+            keys: torch.Tensor,
+            values: torch.Tensor,
+            metadata: Any,
+        ) -> None:
+            if metadata.quantized_page_ids is None:
+                raise AssertionError(
+                    "CacheGen-style KV shadow write requires page IDs"
+                )
+            if metadata.quantized_page_offsets is None:
+                raise AssertionError(
+                    "CacheGen-style KV shadow write requires page offsets"
+                )
+            write_cachegen_int8_mapped_tokens(
+                adapter=self.cachegen_int8_page_adapter,
+                keys=keys,
+                values=values,
+                quantized_page_ids=metadata.quantized_page_ids[
+                    :keys.shape[0]
+                ],
+                quantized_page_offsets=metadata.quantized_page_offsets[
+                    :keys.shape[0]
+                ],
+            )
+
+        attn_metadata.cachegen_int8_shadow_write = shadow_write
+
+    def write_cachegen_int8_shadow_kv(
+        self,
+        *,
+        kv_cache_group_id: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Reference-write mapped K/V tokens into CacheGen-style byte pages.
+
+        This helper is intentionally not called by the normal model forward
+        path. It validates runner-owned block-table mapping and byte-page
+        layout before a future cache-write interception path is introduced.
+        """
+        if self.cachegen_int8_page_adapter is None:
+            raise RuntimeError(
+                "CacheGen-style byte-page adapter is not initialized"
+            )
+        num_kv_cache_groups = len(self.input_batch.block_table.block_tables)
+        if not 0 <= kv_cache_group_id < num_kv_cache_groups:
+            raise ValueError(
+                f"kv_cache_group_id must be in "
+                f"[0, {num_kv_cache_groups}), got {kv_cache_group_id}"
+            )
+
+        num_tokens = keys.shape[0]
+        if values.shape != keys.shape:
+            raise ValueError(
+                f"values must have shape {tuple(keys.shape)}, "
+                f"got {tuple(values.shape)}"
+            )
+
+        block_table = self.input_batch.block_table[kv_cache_group_id]
+        write_cachegen_int8_mapped_tokens(
+            adapter=self.cachegen_int8_page_adapter,
+            keys=keys,
+            values=values,
+            quantized_page_ids=block_table.quantized_page_ids[:num_tokens],
+            quantized_page_offsets=block_table.quantized_page_offsets[
+                :num_tokens
+            ],
         )
 
     def _initialize_cachegen_int8_page_adapter(
