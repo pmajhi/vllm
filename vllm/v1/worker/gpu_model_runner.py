@@ -76,6 +76,12 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
+    CacheGenInt8FixedBytePageAdapter,
+)
+from vllm.v1.worker.experimental.cachegen_int8_page_adapter_config import (
+    is_cachegen_int8_page_adapter_enabled,
+)
 from vllm.v1.worker.experimental.hetero_kv_page_config import (
     get_hetero_kv_page_bytes,
     is_hetero_kv_page_planning_enabled,
@@ -193,6 +199,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Separate experimental byte-page storage. This must not be passed to
         # a standard V1 attention backend until a matching backend exists.
         self.hetero_kv_page_pool: torch.Tensor | None = None
+        self.cachegen_int8_page_adapter: (
+            CacheGenInt8FixedBytePageAdapter | None
+        ) = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -3056,6 +3065,48 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device=device,
         )
 
+    def _initialize_cachegen_int8_page_adapter(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Optionally bind CacheGen-style layout to experimental byte pages."""
+        if not is_cachegen_int8_page_adapter_enabled():
+            self.cachegen_int8_page_adapter = None
+            return
+
+        if self.hetero_kv_page_pool is None:
+            raise AssertionError(
+                "CacheGen-style page adapter requires byte-page storage"
+            )
+
+        decoder_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        ]
+        if not decoder_specs:
+            raise ValueError(
+                "CacheGen-style page adapter requires at least one "
+                "decoder AttentionSpec."
+            )
+
+        geometries = {
+            (spec.num_kv_heads, spec.head_size)
+            for spec in decoder_specs
+        }
+        if len(geometries) != 1:
+            raise ValueError(
+                "CacheGen-style page adapter requires all decoder attention "
+                "groups to share num_kv_heads and head_size."
+            )
+
+        num_kv_heads, head_size = geometries.pop()
+        self.cachegen_int8_page_adapter = CacheGenInt8FixedBytePageAdapter(
+            page_pool=self.hetero_kv_page_pool,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+
     def _initialize_hetero_kv_page_pool(self) -> None:
         """Optionally allocate experimental common fixed-byte GPU pages.
 
@@ -3317,6 +3368,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.may_reinitialize_input_batch(kv_cache_config)
         self._configure_hetero_kv_page_planning(kv_cache_config)
         self._initialize_hetero_kv_page_pool()
+        self._initialize_cachegen_int8_page_adapter(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
