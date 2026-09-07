@@ -24,7 +24,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
-from vllm.v1.quantized_kv_layout import tokens_per_page_for_quantizer
+from vllm.v1.quantized_kv_layout import (
+    get_quantized_kv_page_layout,
+    tokens_per_page_for_quantizer,
+)
 
 
 @dataclass
@@ -347,10 +350,15 @@ class InputBatch:
         # Capacity is derived only from the registered quantizer policy.
         quantizer_id = request.quantizer_id
         self.quantizer_id_cpu[req_index] = quantizer_id
+        baseline_layout = get_quantized_kv_page_layout(0)
+        physical_page_bytes = (
+            self.block_table[0].block_size
+            * baseline_layout.bytes_per_token
+        )
         self.tokens_per_page_cpu[req_index] = (
             tokens_per_page_for_quantizer(
                 quantizer_id,
-                self.block_table[0].block_size,
+                physical_page_bytes,
             )
         )
 

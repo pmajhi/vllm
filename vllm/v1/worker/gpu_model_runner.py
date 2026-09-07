@@ -773,6 +773,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
+
+        self.input_batch.block_table.compute_and_set_quantized_mapping(
+            req_indices,
+            positions_np,
+            self.input_batch.tokens_per_page_cpu,
+        )
+        self.input_batch.block_table.commit_quantized_mapping(
+            total_num_scheduled_tokens)
+
         self.input_batch.commit_quantized_page_metadata(num_reqs)
 
         # Prepare the attention metadata.
@@ -906,6 +915,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_query_len=max_num_scheduled_tokens,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
+                quantizer_id=self.input_batch.quantizer_id_gpu[:num_reqs],
+                tokens_per_page=self.input_batch.tokens_per_page_gpu[:num_reqs],
+                quantized_page_ids=blk_table.quantized_page_ids[
+                    :total_num_scheduled_tokens],
+                quantized_page_offsets=blk_table.quantized_page_offsets[
+                    :total_num_scheduled_tokens],
                 causal=True,
             )
 
@@ -2354,6 +2369,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_group_id].get_device_tensor()[:num_reqs],
                     slot_mapping=self.input_batch.
                     block_table[kv_cache_group_id].slot_mapping[:num_tokens],
+                    quantizer_id=self.input_batch.quantizer_id_gpu[:num_reqs],
+                    tokens_per_page=self.input_batch.tokens_per_page_gpu[:num_reqs],
+                    quantized_page_ids=self.input_batch.block_table[
+                        kv_cache_group_id].quantized_page_ids[:num_tokens],
+                    quantized_page_offsets=self.input_batch.block_table[
+                        kv_cache_group_id].quantized_page_offsets[:num_tokens],
                     causal=True)
 
                 for attn_group in self.attn_groups[kv_cache_group_id]:
@@ -3357,6 +3378,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_query_len=max_num_scheduled_tokens,
                 block_table_tensor=dummy_block_table,
                 slot_mapping=dummy_slot_mapping,
+                quantizer_id=torch.zeros(
+                    num_reqs, dtype=torch.int32, device=self.device),
+                tokens_per_page=torch.full(
+                    (num_reqs,),
+                    self.input_batch.block_table[0].block_size,
+                    dtype=torch.int32,
+                    device=self.device),
+                quantized_page_ids=torch.zeros(
+                    total_num_scheduled_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                quantized_page_offsets=torch.zeros(
+                    total_num_scheduled_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
                 causal=False,
             )
 

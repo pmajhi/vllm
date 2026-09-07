@@ -62,6 +62,13 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    # One entry per active request. These describe the KV-cache codec and
+    # logical tokens per fixed-byte page selected for that request.
+    quantizer_id: torch.Tensor
+    tokens_per_page: torch.Tensor
+    quantized_page_ids: torch.Tensor
+    quantized_page_offsets: torch.Tensor
+
     causal: bool = True
 
 
@@ -119,6 +126,13 @@ def _make_metadata_with_slice(
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
 
+    quantizer_id = attn_metadata.quantizer_id[request_slice]
+    tokens_per_page = attn_metadata.tokens_per_page[request_slice]
+    quantized_page_ids = attn_metadata.quantized_page_ids[token_slice]
+    quantized_page_offsets = (
+        attn_metadata.quantized_page_offsets[token_slice]
+    )
+
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
@@ -130,6 +144,10 @@ def _make_metadata_with_slice(
         max_query_len=max_query_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        quantizer_id=quantizer_id,
+        tokens_per_page=tokens_per_page,
+        quantized_page_ids=quantized_page_ids,
+        quantized_page_offsets=quantized_page_offsets,
     )
 
 
@@ -533,6 +551,10 @@ def make_local_attention_virtual_batches(
         max_query_len=seqlens_q_local.max(),
         block_table_tensor=block_table_local,
         slot_mapping=common_attn_metadata.slot_mapping,
+        quantizer_id=common_attn_metadata.quantizer_id,
+        tokens_per_page=common_attn_metadata.tokens_per_page,
+        quantized_page_ids=common_attn_metadata.quantized_page_ids,
+        quantized_page_offsets=common_attn_metadata.quantized_page_offsets,
         causal=True,
     )
 

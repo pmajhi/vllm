@@ -50,6 +50,31 @@ class BlockTable:
         self.slot_mapping = torch.zeros(self.max_num_batched_tokens,
                                         dtype=torch.int64,
                                         device=self.device)
+        self.quantized_page_ids_cpu = torch.zeros(
+            self.max_num_batched_tokens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        self.quantized_page_ids_np = self.quantized_page_ids_cpu.numpy()
+        self.quantized_page_ids = torch.zeros(
+            self.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        self.quantized_page_offsets_cpu = torch.zeros(
+            self.max_num_batched_tokens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        self.quantized_page_offsets_np = self.quantized_page_offsets_cpu.numpy()
+        self.quantized_page_offsets = torch.zeros(
+            self.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def append_row(
         self,
@@ -97,6 +122,24 @@ class BlockTable:
                block_offsets,
                out=self.slot_mapping_np[:req_indices.shape[0]])
 
+    def set_quantized_mapping(
+        self,
+        physical_page_ids: np.ndarray,
+        page_offsets: np.ndarray,
+    ) -> None:
+        num_tokens = physical_page_ids.shape[0]
+        if page_offsets.shape != physical_page_ids.shape:
+            raise ValueError(
+                "physical_page_ids and page_offsets must have the same shape"
+            )
+        if num_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                "quantized mapping exceeds max_num_batched_tokens"
+            )
+
+        self.quantized_page_ids_np[:num_tokens] = physical_page_ids
+        self.quantized_page_offsets_np[:num_tokens] = page_offsets
+
     def compute_quantized_mapping(
         self,
         req_indices: np.ndarray,
@@ -143,6 +186,19 @@ class BlockTable:
 
         return physical_page_ids.copy(), page_offsets.copy()
 
+    def compute_and_set_quantized_mapping(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        tokens_per_page_by_request: np.ndarray,
+    ) -> None:
+        physical_page_ids, page_offsets = self.compute_quantized_mapping(
+            req_indices,
+            positions,
+            tokens_per_page_by_request,
+        )
+        self.set_quantized_mapping(physical_page_ids, page_offsets)
+
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
                                           non_blocking=True)
@@ -150,6 +206,16 @@ class BlockTable:
     def commit_slot_mapping(self, num_tokens: int) -> None:
         self.slot_mapping[:num_tokens].copy_(
             self.slot_mapping_cpu[:num_tokens], non_blocking=True)
+
+    def commit_quantized_mapping(self, num_tokens: int) -> None:
+        self.quantized_page_ids[:num_tokens].copy_(
+            self.quantized_page_ids_cpu[:num_tokens],
+            non_blocking=True,
+        )
+        self.quantized_page_offsets[:num_tokens].copy_(
+            self.quantized_page_offsets_cpu[:num_tokens],
+            non_blocking=True,
+        )
 
     def clear(self) -> None:
         self.block_table.fill_(0)
@@ -224,6 +290,19 @@ class MultiGroupBlockTable:
         physical_page_ids, page_offsets = zip(*mappings)
         return list(physical_page_ids), list(page_offsets)
 
+    def compute_and_set_quantized_mapping(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        tokens_per_page_by_request: np.ndarray,
+    ) -> None:
+        for block_table in self.block_tables:
+            block_table.compute_and_set_quantized_mapping(
+                req_indices,
+                positions,
+                tokens_per_page_by_request,
+            )
+
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_block_table(num_reqs)
@@ -231,6 +310,10 @@ class MultiGroupBlockTable:
     def commit_slot_mapping(self, num_tokens: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_slot_mapping(num_tokens)
+
+    def commit_quantized_mapping(self, num_tokens: int) -> None:
+        for block_table in self.block_tables:
+            block_table.commit_quantized_mapping(num_tokens)
 
     def clear(self) -> None:
         for block_table in self.block_tables:

@@ -584,6 +584,12 @@ class EagleProposer:
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            quantizer_id=common_attn_metadata.quantizer_id,
+            tokens_per_page=common_attn_metadata.tokens_per_page,
+            quantized_page_ids=common_attn_metadata.quantized_page_ids[
+                token_indices],
+            quantized_page_offsets=common_attn_metadata.quantized_page_offsets[
+                token_indices],
             causal=True,
         )
 
