@@ -8,8 +8,49 @@ from vllm.v1.worker.experimental.hetero_kv_codec_registry import (
 )
 from vllm.v1.worker.experimental.hetero_kv_page_config import (
     HETERO_KV_PAGE_BYTES_ENV_VAR,
+    HETERO_KV_PAGE_PLANNING_ENV_VAR,
     get_hetero_kv_page_bytes,
+    is_hetero_kv_page_planning_enabled,
 )
+
+
+def test_page_planning_defaults_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(HETERO_KV_PAGE_PLANNING_ENV_VAR, raising=False)
+
+    assert not is_hetero_kv_page_planning_enabled()
+
+
+@pytest.mark.parametrize("value", ("1", "true", "TRUE", "yes", " Yes "))
+def test_page_planning_accepts_truthy_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(HETERO_KV_PAGE_PLANNING_ENV_VAR, value)
+
+    assert is_hetero_kv_page_planning_enabled()
+
+
+@pytest.mark.parametrize("value", ("0", "false", "FALSE", "no", " No "))
+def test_page_planning_accepts_falsy_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(HETERO_KV_PAGE_PLANNING_ENV_VAR, value)
+
+    assert not is_hetero_kv_page_planning_enabled()
+
+
+@pytest.mark.parametrize("value", ("", "maybe", "2", "enabled"))
+def test_page_planning_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(HETERO_KV_PAGE_PLANNING_ENV_VAR, value)
+
+    with pytest.raises(ValueError, match=HETERO_KV_PAGE_PLANNING_ENV_VAR):
+        is_hetero_kv_page_planning_enabled()
 
 
 def test_page_bytes_default_to_128kib(monkeypatch: pytest.MonkeyPatch) -> None:

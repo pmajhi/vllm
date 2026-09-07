@@ -76,6 +76,9 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.experimental.hetero_kv_page_config import (
+    is_hetero_kv_page_planning_enabled,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
@@ -3243,6 +3246,41 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                       self.kv_caches)
         return kv_caches
 
+    def _configure_hetero_kv_page_planning(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Install codec capacities after final decoder geometry is known."""
+        if not is_hetero_kv_page_planning_enabled():
+            return
+
+        decoder_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        ]
+        if not decoder_specs:
+            raise ValueError(
+                "Experimental heterogeneous KV page planning requires at "
+                "least one decoder AttentionSpec."
+            )
+
+        geometries = {
+            (spec.num_kv_heads, spec.head_size)
+            for spec in decoder_specs
+        }
+        if len(geometries) != 1:
+            raise ValueError(
+                "Experimental heterogeneous KV page planning requires all "
+                "decoder attention groups to share num_kv_heads and head_size."
+            )
+
+        num_kv_heads, head_size = geometries.pop()
+        self.input_batch.configure_hetero_kv_page_planning(
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -3252,6 +3290,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
+        self._configure_hetero_kv_page_planning(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
