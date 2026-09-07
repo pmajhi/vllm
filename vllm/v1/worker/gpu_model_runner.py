@@ -77,7 +77,12 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.experimental.hetero_kv_page_config import (
+    get_hetero_kv_page_bytes,
     is_hetero_kv_page_planning_enabled,
+)
+from vllm.v1.worker.experimental.hetero_kv_page_pool_config import (
+    get_hetero_kv_page_pool_pages,
+    is_hetero_kv_page_pool_enabled,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
@@ -185,6 +190,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # Separate experimental byte-page storage. This must not be passed to
+        # a standard V1 attention backend until a matching backend exists.
+        self.hetero_kv_page_pool: torch.Tensor | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -3048,6 +3056,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device=device,
         )
 
+    def _initialize_hetero_kv_page_pool(self) -> None:
+        """Optionally allocate experimental common fixed-byte GPU pages.
+
+        Allocation is intentionally separate from standard VLLM KV cache
+        tensors. This establishes physical GPU storage for the experimental
+        heterogeneous path without changing baseline allocation or attention.
+        """
+        if not is_hetero_kv_page_pool_enabled():
+            self.hetero_kv_page_pool = None
+            return
+
+        self.hetero_kv_page_pool = self.allocate_fixed_byte_kv_page_pool(
+            num_pages=get_hetero_kv_page_pool_pages(),
+            page_bytes=get_hetero_kv_page_bytes(),
+            device=self.device,
+        )
+
     def _allocate_kv_cache_tensors(
             self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -3291,6 +3316,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
         self._configure_hetero_kv_page_planning(kv_cache_config)
+        self._initialize_hetero_kv_page_pool()
         self.initialize_attn_backend(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
