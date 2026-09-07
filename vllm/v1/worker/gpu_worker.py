@@ -282,6 +282,90 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def get_cachegen_int8_shadow_diagnostics(
+        self,
+    ) -> dict[str, float | int] | None:
+        """Return explicitly enabled CacheGen shadow-write diagnostics."""
+        return self.model_runner.get_cachegen_int8_shadow_diagnostics()
+
+    def get_cachegen_int8_layer_page_audit(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return one bounded byte-page read audit per CacheGen layer."""
+        return self.model_runner.get_cachegen_int8_layer_page_audit()
+
+    def get_cachegen_int8_decode_route_debug_state(
+        self,
+    ) -> dict[str, object]:
+        """Return metadata required to validate the experimental decode route."""
+        return self.model_runner.get_cachegen_int8_decode_route_debug_state()
+
+    def get_cachegen_int8_calibration_stats(
+        self,
+    ) -> dict[str, object] | None:
+        """Return selected-layer CacheGen INT8 calibration statistics."""
+        return self.model_runner.get_cachegen_int8_calibration_stats()
+
+    def assign_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+        quantizer: str,
+    ) -> dict[str, str]:
+        """Assign an experimental paged-KV quantizer to one request."""
+        return self.model_runner.assign_cachegen_kv_quantizer(
+            request_id,
+            quantizer,
+        )
+
+    def remove_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+    ) -> dict[str, str] | None:
+        """Remove one request's experimental paged-KV quantizer assignment."""
+        return self.model_runner.remove_cachegen_kv_quantizer(request_id)
+
+    def get_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+    ) -> str:
+        """Return one request's quantizer, defaulting safely to native."""
+        return self.model_runner.get_cachegen_kv_quantizer(request_id)
+
+    def snapshot_cachegen_kv_quantizers(self) -> dict[str, str]:
+        """Return active request-to-quantizer assignments."""
+        return self.model_runner.snapshot_cachegen_kv_quantizers()
+
+    def get_cachegen_kv_quantizer_assignment_stats(
+        self,
+    ) -> dict[str, object]:
+        """Return active per-request quantizer assignment statistics."""
+        return self.model_runner.get_cachegen_kv_quantizer_assignment_stats()
+
+    def reset_cachegen_int8_decode_validation(self) -> None:
+        """Reset selected-layer compact INT8 validation pages in place."""
+        self.model_runner.reset_cachegen_int8_decode_validation()
+
+    def get_cachegen_int8_decode_validation_stats(
+        self,
+    ) -> dict[str, object] | None:
+        """Return selected-layer fused INT8 decode validation statistics."""
+        return self.model_runner.get_cachegen_int8_decode_validation_stats()
+
+    def get_cachegen_int8_attention_debug_state(self) -> list[dict[str, object]]:
+        """Return read-only runtime details for registered attention layers."""
+        layers = self.model_runner.compilation_config.static_forward_context
+        return [
+            {
+                "layer_name": layer_name,
+                "backend": str(getattr(layer, "backend", None)),
+                "use_direct_call": bool(
+                    getattr(layer, "use_direct_call", False)
+                ),
+            }
+            for layer_name, layer in layers.items()
+            if "self_attn" in layer_name
+        ]
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 

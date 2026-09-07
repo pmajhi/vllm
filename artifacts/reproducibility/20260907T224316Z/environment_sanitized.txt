@@ -1,0 +1,4 @@
+# Generated reproducibility environment snapshot.
+# Credential values are intentionally excluded.
+VIRTUAL_ENV=/lambda/nfs/pm-asplos/src/vllm/.venv
+VIRTUAL_ENV_PROMPT=(.venv) 

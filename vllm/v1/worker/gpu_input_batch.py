@@ -352,7 +352,12 @@ class InputBatch:
         quantizer_id: int,
         physical_page_bytes: int,
     ) -> int:
-        """Return the logical capacity for one request's selected codec."""
+        """Return the logical capacity for one request's selected codec.
+
+        Baseline codec ID 0 must remain usable without experimental
+        heterogeneous-KV planning. Non-baseline codecs require geometry
+        configured by the experimental page-planning path.
+        """
         if quantizer_id == HeteroKVCodecId.BASELINE:
             return tokens_per_page_for_quantizer(
                 quantizer_id,

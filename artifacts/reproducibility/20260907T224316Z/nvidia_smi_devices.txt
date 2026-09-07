@@ -1,0 +1,1 @@
+GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-95704f5c-db05-75ce-91e7-bdaedab8eaac)

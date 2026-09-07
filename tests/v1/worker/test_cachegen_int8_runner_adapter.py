@@ -17,6 +17,8 @@ def make_runner() -> GPUModelRunner:
         dtype=torch.uint8,
     )
     runner.cachegen_int8_page_adapter = None
+    runner.cachegen_int8_layer_page_pool = None
+    runner.cachegen_int8_page_adapters = {}
     return runner
 
 
@@ -54,6 +56,14 @@ def clear_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv(
         "VLLM_EXPERIMENTAL_CACHEGEN_INT8_PAGE_ADAPTER",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_DIAGNOSTICS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_ALL_LAYERS",
         raising=False,
     )
 
@@ -123,3 +133,213 @@ def test_runner_rejects_mismatched_attention_geometry(
         runner._initialize_cachegen_int8_page_adapter(
             make_attention_config([(8, 128), (16, 128)]),
         )
+
+
+def test_runner_binds_diagnostics_to_byte_pool_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_environment(monkeypatch)
+    enable_adapter(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_DIAGNOSTICS",
+        "1",
+    )
+    runner = make_runner()
+
+    runner._initialize_cachegen_int8_page_adapter(
+        make_attention_config([(8, 128)]),
+    )
+
+    assert runner.cachegen_int8_shadow_callback_calls is not None
+    assert runner.cachegen_int8_shadow_tokens_written is not None
+    assert (
+        runner.cachegen_int8_shadow_callback_calls.device
+        == runner.hetero_kv_page_pool.device
+    )
+    assert (
+        runner.cachegen_int8_shadow_tokens_written.device
+        == runner.hetero_kv_page_pool.device
+    )
+
+
+def test_runner_binds_layer_isolated_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_environment(monkeypatch)
+    enable_adapter(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_WRITE",
+        "1",
+    )
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_ALL_LAYERS",
+        "1",
+    )
+
+    runner = make_runner()
+    layer_names = ["layers.0.attn", "layers.1.attn"]
+    from vllm.v1.worker.experimental.cachegen_int8_layer_page_pool import (
+        CacheGenInt8LayerPagePool,
+    )
+
+    runner.cachegen_int8_layer_page_pool = CacheGenInt8LayerPagePool.allocate(
+        layer_names=layer_names,
+        pages_per_layer=2,
+        page_bytes=128 * 1024,
+        device=torch.device("cpu"),
+    )
+    runner.hetero_kv_page_pool = runner.cachegen_int8_layer_page_pool.page_pool
+
+    runner._initialize_cachegen_int8_page_adapter(
+        make_attention_config([(8, 128)]),
+    )
+
+    assert runner.cachegen_int8_page_adapter is None
+    assert set(runner.cachegen_int8_page_adapters) == set(layer_names)
+
+    first = runner.cachegen_int8_page_adapters[layer_names[0]]
+    second = runner.cachegen_int8_page_adapters[layer_names[1]]
+    assert first.page_pool.shape == (2, 128 * 1024)
+    assert second.page_pool.shape == (2, 128 * 1024)
+    assert first.page_pool.data_ptr() != second.page_pool.data_ptr()
+
+
+def test_layer_isolated_adapters_do_not_alias_logical_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_environment(monkeypatch)
+    enable_adapter(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_WRITE",
+        "1",
+    )
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_ALL_LAYERS",
+        "1",
+    )
+
+    runner = make_runner()
+    layer_names = ["layers.0.attn", "layers.1.attn"]
+    from vllm.v1.worker.experimental.cachegen_int8_layer_page_pool import (
+        CacheGenInt8LayerPagePool,
+    )
+
+    runner.cachegen_int8_layer_page_pool = CacheGenInt8LayerPagePool.allocate(
+        layer_names=layer_names,
+        pages_per_layer=2,
+        page_bytes=128 * 1024,
+        device=torch.device("cpu"),
+    )
+    runner.hetero_kv_page_pool = runner.cachegen_int8_layer_page_pool.page_pool
+
+    runner._initialize_cachegen_int8_page_adapter(
+        make_attention_config([(8, 128)]),
+    )
+
+    first = runner.cachegen_int8_page_adapters[layer_names[0]]
+    second = runner.cachegen_int8_page_adapters[layer_names[1]]
+
+    first_key = torch.full((8, 128), 0.25, dtype=torch.float32)
+    first_value = torch.full((8, 128), -0.50, dtype=torch.float32)
+    second_key = torch.full((8, 128), 1.50, dtype=torch.float32)
+    second_value = torch.full((8, 128), -1.25, dtype=torch.float32)
+
+    first.write_token(
+        page_id=0,
+        page_offset=0,
+        key=first_key,
+        value=first_value,
+    )
+    second.write_token(
+        page_id=0,
+        page_offset=0,
+        key=second_key,
+        value=second_value,
+    )
+
+    decoded_first_key, decoded_first_value = first.read_token(
+        page_id=0,
+        page_offset=0,
+    )
+    decoded_second_key, decoded_second_value = second.read_token(
+        page_id=0,
+        page_offset=0,
+    )
+
+    assert torch.allclose(decoded_first_key, first_key, atol=0.01, rtol=0)
+    assert torch.allclose(decoded_first_value, first_value, atol=0.01, rtol=0)
+    assert torch.allclose(decoded_second_key, second_key, atol=0.01, rtol=0)
+    assert torch.allclose(decoded_second_value, second_value, atol=0.01, rtol=0)
+
+
+def test_all_layers_requires_layer_isolated_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_environment(monkeypatch)
+    enable_adapter(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_WRITE",
+        "1",
+    )
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_ALL_LAYERS",
+        "1",
+    )
+
+    runner = make_runner()
+
+    with pytest.raises(
+        AssertionError,
+        match="requires layer-isolated byte-page storage",
+    ):
+        runner._initialize_cachegen_int8_page_adapter(
+            make_attention_config([(8, 128)]),
+        )
+
+
+def test_runner_resolves_layer_local_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_environment(monkeypatch)
+    enable_adapter(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_WRITE",
+        "1",
+    )
+    monkeypatch.setenv(
+        "VLLM_EXPERIMENTAL_CACHEGEN_INT8_SHADOW_ALL_LAYERS",
+        "1",
+    )
+
+    runner = make_runner()
+    from vllm.v1.worker.experimental.cachegen_int8_layer_page_pool import (
+        CacheGenInt8LayerPagePool,
+    )
+
+    layer_names = ["layers.0.attn", "layers.1.attn"]
+    runner.cachegen_int8_layer_page_pool = CacheGenInt8LayerPagePool.allocate(
+        layer_names=layer_names,
+        pages_per_layer=2,
+        page_bytes=128 * 1024,
+        device=torch.device("cpu"),
+    )
+    runner.hetero_kv_page_pool = runner.cachegen_int8_layer_page_pool.page_pool
+    runner._initialize_cachegen_int8_page_adapter(
+        make_attention_config([(8, 128)]),
+    )
+
+    assert (
+        runner.get_cachegen_int8_page_adapter(
+            layer_name="layers.0.attn"
+        )
+        is runner.cachegen_int8_page_adapters["layers.0.attn"]
+    )
+    assert (
+        runner.get_cachegen_int8_page_adapter(
+            layer_name="layers.1.attn"
+        )
+        is runner.cachegen_int8_page_adapters["layers.1.attn"]
+    )
+
+    with pytest.raises(ValueError, match="No CacheGen-style byte-page adapter"):
+        runner.get_cachegen_int8_page_adapter(layer_name="layers.2.attn")

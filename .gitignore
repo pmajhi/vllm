@@ -210,3 +210,33 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
+# Local Python environments and caches.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Large local model/data caches.
+.cache/
+huggingface/
+hf_cache/
+wandb/
+runs/
+
+# Generated benchmark artifacts; keep reproducibility manifests and source only.
+artifacts/runtime/
+artifacts/fixed_byte/
+artifacts/mixed_quantizer/
+artifacts/motivation/
+artifacts/int8_correctness/
+*.log
+
+# Never commit full process environments: they may contain credentials.
+artifacts/reproducibility/*/environment_all.txt
+artifacts/reproducibility/*/environment_secrets.txt
+artifacts/reproducibility/*/environment_relevant.txt
+artifacts/reproducibility/*.tar.gz

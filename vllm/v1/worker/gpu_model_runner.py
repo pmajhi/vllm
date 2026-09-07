@@ -80,8 +80,54 @@ from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
     CacheGenInt8FixedBytePageAdapter,
     write_cachegen_int8_mapped_tokens,
 )
+from vllm.v1.worker.experimental.cachegen_int8_layer_page_pool import (
+    CacheGenInt8LayerPagePool,
+)
 from vllm.v1.worker.experimental.cachegen_int8_page_adapter_config import (
     is_cachegen_int8_page_adapter_enabled,
+)
+from vllm.v1.worker.experimental.cachegen_kv_quantizer_assignment_table import (
+    CacheGenKVQuantizerAssignmentTable,
+)
+from vllm.v1.worker.experimental.cachegen_quantizer_types import (
+    CacheGenKVQuantizer,
+)
+
+from vllm.v1.worker.experimental.cachegen_int8_attention_config import (
+    get_cachegen_int8_attention_layer,
+    get_cachegen_int8_attention_mode,
+    get_cachegen_int8_attention_max_pages,
+    is_cachegen_int8_attention_enabled,
+)
+from vllm.v1.worker.experimental.cachegen_int8_calibration_config import (
+    get_cachegen_int8_calibration_layer,
+)
+
+from vllm.v1.worker.experimental.cachegen_int8_decode_route import (
+    get_cachegen_int8_decode_route_decision,
+)
+from vllm.v1.worker.experimental.cachegen_int8_dynamic_selected_layer_cache import (
+    CacheGenInt8DynamicSelectedLayerCache,
+)
+from vllm.v1.worker.experimental.cachegen_int8_common_page_decode_triton import (
+    cachegen_int8_common_page_decode_attention_triton,
+)
+
+from vllm.v1.worker.experimental.cachegen_int8_paged_decode_attention import (
+    cachegen_int8_paged_decode_attention_triton,
+)
+
+from vllm.v1.worker.experimental.cachegen_int8_shadow_all_layers_config import (
+    is_cachegen_int8_shadow_all_layers_enabled,
+)
+from vllm.v1.worker.experimental.cachegen_int8_shadow_diagnostics_config import (
+    is_cachegen_int8_shadow_diagnostics_enabled,
+)
+from vllm.v1.worker.experimental.cachegen_int8_shadow_layer_config import (
+    get_cachegen_int8_shadow_layer,
+)
+from vllm.v1.worker.experimental.cachegen_int8_shadow_sample_config import (
+    is_cachegen_int8_shadow_sample_enabled,
 )
 from vllm.v1.worker.experimental.cachegen_int8_shadow_write_config import (
     is_cachegen_int8_shadow_write_enabled,
@@ -209,9 +255,52 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Separate experimental byte-page storage. This must not be passed to
         # a standard V1 attention backend until a matching backend exists.
         self.hetero_kv_page_pool: torch.Tensor | None = None
+        self.cachegen_int8_layer_page_pool: CacheGenInt8LayerPagePool | None = None
+        self.cachegen_int8_pages_per_layer: int | None = None
         self.cachegen_int8_page_adapter: (
             CacheGenInt8FixedBytePageAdapter | None
         ) = None
+        self.cachegen_int8_page_adapters: dict[
+            str, CacheGenInt8FixedBytePageAdapter
+        ] = {}
+        self.cachegen_int8_shadow_callback_calls: torch.Tensor | None = None
+        self.cachegen_int8_shadow_tokens_written: torch.Tensor | None = None
+        self.cachegen_int8_shadow_layer_counters: dict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self.cachegen_int8_shadow_sample: dict[str, float | int] | None = None
+
+        # Selected-layer fused INT8 decode validation state. Native
+        # FlashAttention remains authoritative until the validation route is
+        # explicitly promoted to the model-output path.
+        self.cachegen_int8_selected_layer_cache: (
+            CacheGenInt8DynamicSelectedLayerCache | None
+        ) = None
+        self.cachegen_int8_resolved_attention_layer: str | None = None
+        self.cachegen_kv_quantizer_assignments = (
+            CacheGenKVQuantizerAssignmentTable()
+        )
+
+        self.cachegen_int8_decode_validation_stats: dict[str, float | int] = {
+            "callback_calls": 0,
+            "route_eligible_calls": 0,
+            "route_capacity_fallbacks": 0,
+            "route_unsupported_fallbacks": 0,
+            "route_fallback_reasons": {},
+            "native_output_calls": 0,
+            "int8_output_calls": 0,
+            "common_page_int8_output_calls": 0,
+            "reset_calls": 0,
+            "common_page_fused_calls": 0,
+            "common_page_missing_mirror_fallbacks": 0,
+            "common_page_max_abs_error_vs_typed": 0.0,
+            "common_page_mean_abs_error_vs_typed_sum": 0.0,
+            "common_page_mean_abs_error_vs_typed_count": 0,
+            "max_abs_error": 0.0,
+            "mean_abs_error_sum": 0.0,
+            "mean_abs_error_count": 0,
+        }
+        self.cachegen_int8_calibration_stats: dict[str, object] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -975,9 +1064,68 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                 ))
-                self._attach_cachegen_int8_shadow_write(
-                    attn_metadata=attn_metadata_i,
+
+                active_request_ids = list(
+                    scheduler_output.num_scheduled_tokens.keys()
                 )
+                attn_metadata_i.cachegen_kv_quantizer = (
+                    self._get_cachegen_kv_quantizer_for_metadata(
+                        request_ids=active_request_ids,
+                    )
+                )
+
+                all_layers_enabled = (
+                    is_cachegen_int8_shadow_all_layers_enabled()
+                )
+                selected_layer = (
+                    None
+                    if all_layers_enabled
+                    else get_cachegen_int8_shadow_layer()
+                )
+                layer_metadata_overrides: dict[str, Any] = {}
+                for layer_name in attn_group.layer_names:
+                    needs_calibration = (
+                        get_cachegen_int8_calibration_layer() == layer_name
+                    )
+                    needs_decode_validation = (
+                        is_cachegen_int8_attention_enabled()
+                        and attn_metadata_i.cachegen_kv_quantizer
+                        == CacheGenKVQuantizer.INT8_ADAPTIVE.value
+                        and self.cachegen_int8_resolved_attention_layer
+                        == layer_name
+                    )
+                    needs_shadow_write = (
+                        is_cachegen_int8_shadow_write_enabled()
+                        and (
+                            all_layers_enabled
+                            or layer_name == selected_layer
+                        )
+                    )
+                    if (
+                        not needs_calibration
+                        and not needs_decode_validation
+                        and not needs_shadow_write
+                    ):
+                        continue
+
+                    layer_metadata = dataclasses.replace(attn_metadata_i)
+                    if needs_calibration:
+                        self._attach_cachegen_int8_calibration(
+                            layer_name=layer_name,
+                            attn_metadata=layer_metadata,
+                        )
+                    if needs_decode_validation:
+                        self._attach_cachegen_int8_decode_validation(
+                            layer_name=layer_name,
+                            attn_metadata=layer_metadata,
+                            kv_cache_group_id=kv_cache_group_id,
+                        )
+                    if needs_shadow_write:
+                        self._attach_cachegen_int8_shadow_write(
+                            layer_name=layer_name,
+                            attn_metadata=layer_metadata,
+                        )
+                    layer_metadata_overrides[layer_name] = layer_metadata
 
                 fast_prefill_metadata = attn_metadata_i
                 if (self.cache_config.kv_sharing_fast_prefill
@@ -995,13 +1143,58 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         num_logits_indices=logits_indices.size(0),
                     )
 
+                self._last_cachegen_int8_attn_metadata = {
+                    layer_name: {
+                        "num_actual_tokens": int(attn_metadata_i.num_actual_tokens),
+                        "max_query_len": int(attn_metadata_i.max_query_len),
+                        "max_seq_len": int(attn_metadata_i.max_seq_len),
+                        "seq_lens": attn_metadata_i.seq_lens.tolist(),
+                        "query_start_loc": (
+                            attn_metadata_i.query_start_loc.tolist()
+                        ),
+                        "block_table_shape": list(
+                            attn_metadata_i.block_table.shape
+                        ),
+                        "active_block_table": (
+                            attn_metadata_i.block_table[
+                                :1,
+                                :(
+                                    int(attn_metadata_i.max_seq_len)
+                                    + self.input_batch.block_table[
+                                        kv_cache_group_id
+                                    ].block_size
+                                    - 1
+                                )
+                                // self.input_batch.block_table[
+                                    kv_cache_group_id
+                                ].block_size
+                            ].tolist()
+                        ),
+                        "quantized_page_ids": (
+                            attn_metadata_i.quantized_page_ids.tolist()
+                            if attn_metadata_i.quantized_page_ids is not None
+                            else None
+                        ),
+                        "quantized_page_offsets": (
+                            attn_metadata_i.quantized_page_offsets.tolist()
+                            if attn_metadata_i.quantized_page_offsets is not None
+                            else None
+                        ),
+                    }
+                    for layer_name in attn_group.layer_names
+                }
+
                 for layer_name in attn_group.layer_names:
-                    if (self.cache_config.kv_sharing_fast_prefill
+                    if layer_name in layer_metadata_overrides:
+                        attn_metadata[layer_name] = (
+                            layer_metadata_overrides[layer_name]
+                        )
+                    elif (self.cache_config.kv_sharing_fast_prefill
                             and layer_name
                             in self.kv_sharing_fast_prefill_eligible_layers):
                         attn_metadata[layer_name] = fast_prefill_metadata
-                        continue
-                    attn_metadata[layer_name] = attn_metadata_i
+                    else:
+                        attn_metadata[layer_name] = attn_metadata_i
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -3078,13 +3271,467 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device=device,
         )
 
+    def get_cachegen_int8_page_adapter(
+        self,
+        *,
+        layer_name: str,
+    ) -> CacheGenInt8FixedBytePageAdapter:
+        """Return the CacheGen byte-page adapter for one attention layer."""
+        layer_adapters = getattr(self, "cachegen_int8_page_adapters", {})
+        if layer_adapters:
+            try:
+                return layer_adapters[layer_name]
+            except KeyError as exc:
+                raise ValueError(
+                    "No CacheGen-style byte-page adapter is configured for "
+                    f"layer {layer_name!r}"
+                ) from exc
+
+        adapter = getattr(self, "cachegen_int8_page_adapter", None)
+        if adapter is not None:
+            return adapter
+
+        raise ValueError(
+            "No CacheGen-style byte-page adapter is configured for "
+            f"layer {layer_name!r}"
+        )
+
+    def _remap_cachegen_int8_shadow_page_ids(
+        self,
+        *,
+        page_ids: torch.Tensor,
+        adapter: CacheGenInt8FixedBytePageAdapter,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map normal KV page IDs into the bounded shadow-pool ID space.
+
+        The mapping is runner-global rather than layer-local so every captured
+        layer writes the same normal KV locations to the same local page IDs.
+        Entries that cannot be assigned a bounded local page are omitted.
+        """
+        if page_ids.ndim != 1:
+            raise ValueError(
+                f"page_ids must be rank 1, got shape {tuple(page_ids.shape)}"
+            )
+
+        remapped_ids = torch.empty_like(page_ids)
+        keep_mask = torch.zeros_like(page_ids, dtype=torch.bool)
+
+        for index, normal_page_id in enumerate(page_ids.tolist()):
+            shadow_page_id = self.cachegen_int8_shadow_page_id_map.get(
+                normal_page_id
+            )
+            if shadow_page_id is None:
+                if len(self.cachegen_int8_shadow_page_id_map) >= adapter.num_pages:
+                    self.cachegen_int8_shadow_dropped_page_ids.add(
+                        normal_page_id
+                    )
+                    continue
+                shadow_page_id = len(self.cachegen_int8_shadow_page_id_map)
+                self.cachegen_int8_shadow_page_id_map[normal_page_id] = (
+                    shadow_page_id
+                )
+            remapped_ids[index] = shadow_page_id
+            keep_mask[index] = True
+
+        return remapped_ids, keep_mask
+
+    def _get_cachegen_kv_quantizer_for_metadata(
+        self,
+        *,
+        request_ids: list[str],
+    ) -> str:
+        """Return one safe quantizer selection for an attention metadata batch.
+
+        Explicit per-request assignment has priority. For backward-compatible
+        single-request experiments, the enabled CacheGen INT8 environment
+        route supplies an INT8 default when no assignment exists. Mixed
+        batches always remain native because the initial fused route supports
+        exactly one sequence.
+        """
+        if len(request_ids) != 1:
+            return CacheGenKVQuantizer.NATIVE.value
+
+        request_id = request_ids[0]
+        assignment = self.cachegen_kv_quantizer_assignments.get(request_id)
+        if assignment is not None:
+            return assignment.quantizer_id
+
+        if is_cachegen_int8_attention_enabled():
+            return CacheGenKVQuantizer.INT8_ADAPTIVE.value
+        return CacheGenKVQuantizer.NATIVE.value
+
+    def _attach_cachegen_int8_decode_validation(
+        self,
+        *,
+        layer_name: str,
+        attn_metadata: Any,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Attach selected-layer dynamic INT8 fused-decode validation.
+
+        This callback writes actual K/V values to compact INT8 pages and
+        computes a fused candidate. Native FlashAttention remains responsible
+        for the model output; its output is compared after native attention.
+        """
+        if not is_cachegen_int8_attention_enabled():
+            return
+
+        selected_layer = self.cachegen_int8_resolved_attention_layer
+        if layer_name != selected_layer:
+            return
+
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "CacheGen INT8 decode validation requires cudagraph_mode=NONE"
+            )
+        if not hasattr(attn_metadata, "cachegen_int8_decode_validation"):
+            return
+
+        selected_cache = self.cachegen_int8_selected_layer_cache
+        if selected_cache is None:
+            raise AssertionError(
+                "CacheGen INT8 selected-layer cache is not initialized"
+            )
+
+        native_block_size = self.input_batch.block_table[
+            kv_cache_group_id
+        ].block_size
+        attention_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            Attention,
+        )
+        try:
+            attention_layer = attention_layers[layer_name]
+        except KeyError as exc:
+            raise ValueError(
+                "No Attention module found for CacheGen INT8 decode validation "
+                f"layer {layer_name!r}"
+            ) from exc
+
+        def validate(
+            query: torch.Tensor,
+            keys: torch.Tensor,
+            values: torch.Tensor,
+            metadata: Any,
+        ) -> None:
+            stats = self.cachegen_int8_decode_validation_stats
+            stats["callback_calls"] = int(stats["callback_calls"]) + 1
+
+            native_slots = metadata.slot_mapping[:metadata.num_actual_tokens]
+            native_page_ids = torch.div(
+                native_slots,
+                native_block_size,
+                rounding_mode="floor",
+            ).to(torch.int32)
+            native_page_offsets = torch.remainder(
+                native_slots,
+                native_block_size,
+            ).to(torch.int32)
+
+            wrote_pages = selected_cache.write_native_mapped_tokens(
+                keys=keys,
+                values=values,
+                native_page_ids=native_page_ids,
+                page_offsets=native_page_offsets,
+            )
+            if not wrote_pages:
+                stats["route_capacity_fallbacks"] = (
+                    int(stats["route_capacity_fallbacks"]) + 1
+                )
+                return
+            stats["tokens_written"] = (
+                int(stats["tokens_written"]) + keys.shape[0]
+            )
+
+            decision = get_cachegen_int8_decode_route_decision(
+                num_actual_tokens=metadata.num_actual_tokens,
+                max_query_len=metadata.max_query_len,
+                seq_lens=metadata.seq_lens,
+                query_start_loc=metadata.query_start_loc,
+                block_table=metadata.block_table,
+                block_size=native_block_size,
+                use_cascade=metadata.use_cascade,
+                sliding_window=attention_layer.impl.sliding_window,
+                has_kv_sharing=(
+                    attention_layer.kv_sharing_target_layer_name is not None
+                ),
+            )
+            if not decision.is_eligible:
+                stats["route_unsupported_fallbacks"] = (
+                    int(stats["route_unsupported_fallbacks"]) + 1
+                )
+                reason = decision.reason
+                assert reason is not None
+                fallback_reasons = stats.setdefault(
+                    "route_fallback_reasons",
+                    {},
+                )
+                assert isinstance(fallback_reasons, dict)
+                fallback_reasons[reason] = (
+                    int(fallback_reasons.get(reason, 0)) + 1
+                )
+                return
+
+            plan = decision.plan
+            assert plan is not None
+            compact_block_table = selected_cache.map_active_block_table(
+                plan.block_table
+            )
+            if compact_block_table is None:
+                stats["route_capacity_fallbacks"] = (
+                    int(stats["route_capacity_fallbacks"]) + 1
+                )
+                return
+
+            metadata.cachegen_int8_fused_decode_output = (
+                cachegen_int8_paged_decode_attention_triton(
+                    query=query[0],
+                    cache=selected_cache.page_store.as_paged_kv(),
+                    block_table=compact_block_table,
+                    seq_len=plan.sequence_length,
+                )
+            )
+
+            if selected_cache.has_common_page_ids(
+                compact_page_ids=compact_block_table,
+            ):
+                common_page_ids = selected_cache.get_common_page_ids(
+                    compact_page_ids=compact_block_table,
+                )
+                common_page_format = (
+                    selected_cache.common_page_codec.page_format
+                )
+                key_scales = selected_cache.common_page_codec.key_scales_by_page
+                value_scales = (
+                    selected_cache.common_page_codec.value_scales_by_page
+                )
+                assert key_scales is not None
+                assert value_scales is not None
+                metadata.cachegen_int8_common_page_decode_output = (
+                    cachegen_int8_common_page_decode_attention_triton(
+                        query=query[0],
+                        page_bytes=selected_cache.common_page_pool.page_bytes,
+                        key_scales=key_scales,
+                        value_scales=value_scales,
+                        page_ids=common_page_ids,
+                        sequence_length=plan.sequence_length,
+                        num_kv_heads=selected_cache.common_page_codec.
+                        layout.num_kv_heads,
+                        tokens_per_page=selected_cache.common_page_codec.
+                        layout.tokens_per_page,
+                        head_size=selected_cache.common_page_codec.layout.
+                        head_size,
+                        metadata_nbytes=common_page_format.metadata_nbytes,
+                        key_payload_offset=common_page_format.key_payload_offset,
+                        value_payload_offset=(
+                            common_page_format.value_payload_offset
+                        ),
+                    )
+                )
+                stats["common_page_fused_calls"] = (
+                    int(stats.setdefault("common_page_fused_calls", 0)) + 1
+                )
+
+                if get_cachegen_int8_attention_mode() == "common_page_int8":
+                    metadata.cachegen_int8_fused_decode_output = (
+                        metadata.cachegen_int8_common_page_decode_output
+                    )
+
+            else:
+                stats["common_page_missing_mirror_fallbacks"] = (
+                    int(
+                        stats.setdefault(
+                            "common_page_missing_mirror_fallbacks",
+                            0,
+                        )
+                    )
+                    + 1
+                )
+            stats["route_eligible_calls"] = (
+                int(stats["route_eligible_calls"]) + 1
+            )
+
+        attn_metadata.cachegen_int8_decode_validation = validate
+
+        def record_result(result: dict[str, float]) -> None:
+            stats = self.cachegen_int8_decode_validation_stats
+            stats["max_abs_error"] = max(
+                float(stats["max_abs_error"]),
+                result["max_abs_error"],
+            )
+            stats["mean_abs_error_sum"] = (
+                float(stats["mean_abs_error_sum"])
+                + result["mean_abs_error"]
+            )
+            stats["mean_abs_error_count"] = (
+                int(stats["mean_abs_error_count"]) + 1
+            )
+
+            common_page_max_error = result.get(
+                "common_page_max_abs_error_vs_typed"
+            )
+            common_page_mean_error = result.get(
+                "common_page_mean_abs_error_vs_typed"
+            )
+            if (
+                common_page_max_error is not None
+                and common_page_mean_error is not None
+            ):
+                stats["common_page_max_abs_error_vs_typed"] = max(
+                    float(
+                        stats.setdefault(
+                            "common_page_max_abs_error_vs_typed",
+                            0.0,
+                        )
+                    ),
+                    float(common_page_max_error),
+                )
+                stats["common_page_mean_abs_error_vs_typed_sum"] = (
+                    float(
+                        stats.setdefault(
+                            "common_page_mean_abs_error_vs_typed_sum",
+                            0.0,
+                        )
+                    )
+                    + float(common_page_mean_error)
+                )
+                stats["common_page_mean_abs_error_vs_typed_count"] = (
+                    int(
+                        stats.setdefault(
+                            "common_page_mean_abs_error_vs_typed_count",
+                            0,
+                        )
+                    )
+                    + 1
+                )
+
+            mode = get_cachegen_int8_attention_mode()
+            if mode == "common_page_int8":
+                stats["common_page_int8_output_calls"] = (
+                    int(
+                        stats.setdefault(
+                            "common_page_int8_output_calls",
+                            0,
+                        )
+                    )
+                    + 1
+                )
+            elif mode == "int8":
+                stats["int8_output_calls"] = (
+                    int(stats.setdefault("int8_output_calls", 0)) + 1
+                )
+            else:
+                stats["native_output_calls"] = (
+                    int(stats.setdefault("native_output_calls", 0)) + 1
+                )
+
+        attn_metadata.cachegen_int8_decode_validation_result = record_result
+
+    def _attach_cachegen_int8_calibration(
+        self,
+        *,
+        layer_name: str,
+        attn_metadata: Any,
+    ) -> None:
+        """Attach per-KV-head K/V range collection for one selected layer."""
+        selected_layer = get_cachegen_int8_calibration_layer()
+        if selected_layer is None or layer_name != selected_layer:
+            return
+
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "CacheGen INT8 calibration requires cudagraph_mode=NONE"
+            )
+        if not hasattr(attn_metadata, "cachegen_int8_calibration"):
+            return
+
+        if self.cachegen_int8_calibration_stats is None:
+            attention_layers = get_layers_from_vllm_config(
+                self.vllm_config,
+                Attention,
+            )
+            try:
+                attention_layer = attention_layers[layer_name]
+            except KeyError as exc:
+                raise ValueError(
+                    "No Attention module found for CacheGen INT8 calibration "
+                    f"layer {layer_name!r}"
+                ) from exc
+
+            self.cachegen_int8_calibration_stats = {
+                "layer_name": layer_name,
+                "callback_calls": 0,
+                "tokens_seen": 0,
+                "key_abs_max_per_head": torch.zeros(
+                    attention_layer.num_kv_heads,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "value_abs_max_per_head": torch.zeros(
+                    attention_layer.num_kv_heads,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            }
+
+        def calibrate(
+            keys: torch.Tensor,
+            values: torch.Tensor,
+            metadata: Any,
+        ) -> None:
+            del metadata
+            assert self.cachegen_int8_calibration_stats is not None
+
+            key_abs_max = keys.float().abs().amax(dim=(0, 2))
+            value_abs_max = values.float().abs().amax(dim=(0, 2))
+
+            stored_key_abs_max = self.cachegen_int8_calibration_stats[
+                "key_abs_max_per_head"
+            ]
+            stored_value_abs_max = self.cachegen_int8_calibration_stats[
+                "value_abs_max_per_head"
+            ]
+            assert isinstance(stored_key_abs_max, torch.Tensor)
+            assert isinstance(stored_value_abs_max, torch.Tensor)
+
+            torch.maximum(
+                stored_key_abs_max,
+                key_abs_max,
+                out=stored_key_abs_max,
+            )
+            torch.maximum(
+                stored_value_abs_max,
+                value_abs_max,
+                out=stored_value_abs_max,
+            )
+
+            self.cachegen_int8_calibration_stats["callback_calls"] = (
+                int(self.cachegen_int8_calibration_stats["callback_calls"]) + 1
+            )
+            self.cachegen_int8_calibration_stats["tokens_seen"] = (
+                int(self.cachegen_int8_calibration_stats["tokens_seen"])
+                + keys.shape[0]
+            )
+
+        attn_metadata.cachegen_int8_calibration = calibrate
+
     def _attach_cachegen_int8_shadow_write(
         self,
         *,
+        layer_name: str,
         attn_metadata: Any,
     ) -> None:
         """Attach an eager-only CacheGen-style K/V shadow-write callback."""
         if not is_cachegen_int8_shadow_write_enabled():
+            return
+
+        all_layers_enabled = is_cachegen_int8_shadow_all_layers_enabled()
+        selected_layer = (
+            None
+            if all_layers_enabled
+            else get_cachegen_int8_shadow_layer()
+        )
+        if not all_layers_enabled and layer_name != selected_layer:
             return
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
@@ -3092,10 +3739,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "CacheGen-style KV shadow write requires "
                 "cudagraph_mode=NONE"
             )
-        if self.cachegen_int8_page_adapter is None:
+
+        try:
+            adapter = self.get_cachegen_int8_page_adapter(
+                layer_name=layer_name,
+            )
+        except ValueError as exc:
+            if all_layers_enabled:
+                raise AssertionError(
+                    "CacheGen-style all-layer shadow write requires a "
+                    f"layer-local adapter for {layer_name!r}"
+                ) from exc
             raise AssertionError(
                 "CacheGen-style KV shadow write requires the page adapter"
-            )
+            ) from exc
+
         if not hasattr(attn_metadata, "cachegen_int8_shadow_write"):
             return
         if attn_metadata.quantizer_id is None:
@@ -3121,37 +3779,108 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 raise AssertionError(
                     "CacheGen-style KV shadow write requires page offsets"
                 )
-            write_cachegen_int8_mapped_tokens(
-                adapter=self.cachegen_int8_page_adapter,
-                keys=keys,
-                values=values,
-                quantized_page_ids=metadata.quantized_page_ids[
-                    :keys.shape[0]
-                ],
-                quantized_page_offsets=metadata.quantized_page_offsets[
-                    :keys.shape[0]
-                ],
+
+            quantized_page_ids = metadata.quantized_page_ids[
+                :keys.shape[0]
+            ]
+            quantized_page_offsets = metadata.quantized_page_offsets[
+                :keys.shape[0]
+            ]
+            capture_mask = quantized_page_ids < adapter.num_pages
+
+            if bool(capture_mask.any()):
+                write_cachegen_int8_mapped_tokens(
+                    adapter=adapter,
+                    keys=keys[capture_mask],
+                    values=values[capture_mask],
+                    quantized_page_ids=quantized_page_ids[capture_mask],
+                    quantized_page_offsets=quantized_page_offsets[capture_mask],
+                )
+
+            captured_tokens = int(capture_mask.sum().item())
+
+            callback_calls = getattr(
+                self,
+                "cachegen_int8_shadow_callback_calls",
+                None,
             )
+            if callback_calls is not None:
+                tokens_written = getattr(
+                    self,
+                    "cachegen_int8_shadow_tokens_written",
+                    None,
+                )
+                assert tokens_written is not None
+                callback_calls.add_(1)
+                tokens_written.add_(captured_tokens)
+
+            layer_counters = getattr(
+                self,
+                "cachegen_int8_shadow_layer_counters",
+                {},
+            )
+            layer_counter = layer_counters.get(layer_name)
+            if layer_counter is not None:
+                layer_callback_calls, layer_tokens_written = layer_counter
+                layer_callback_calls.add_(1)
+                layer_tokens_written.add_(captured_tokens)
+
+            if (
+                captured_tokens > 0
+                and is_cachegen_int8_shadow_sample_enabled()
+                and self.cachegen_int8_shadow_sample is None
+            ):
+                first_captured_index = int(
+                    torch.nonzero(capture_mask, as_tuple=False)[0].item()
+                )
+                page_id = int(quantized_page_ids[first_captured_index].item())
+                page_offset = int(
+                    quantized_page_offsets[first_captured_index].item()
+                )
+                decoded_key, decoded_value = adapter.read_token(
+                    page_id=page_id,
+                    page_offset=page_offset,
+                    dtype=torch.float32,
+                )
+                key_error = decoded_key - keys[0].to(torch.float32)
+                value_error = decoded_value - values[0].to(torch.float32)
+                self.cachegen_int8_shadow_sample = {
+                    "layer_name": layer_name,
+                    "page_id": page_id,
+                    "page_offset": page_offset,
+                    "key_max_abs_error": float(key_error.abs().amax().item()),
+                    "value_max_abs_error": float(
+                        value_error.abs().amax().item()
+                    ),
+                    "key_rmse": float(key_error.square().mean().sqrt().item()),
+                    "value_rmse": float(
+                        value_error.square().mean().sqrt().item()
+                    ),
+                }
 
         attn_metadata.cachegen_int8_shadow_write = shadow_write
 
     def write_cachegen_int8_shadow_kv(
         self,
         *,
+        layer_name: str,
         kv_cache_group_id: int,
         keys: torch.Tensor,
         values: torch.Tensor,
     ) -> None:
-        """Reference-write mapped K/V tokens into CacheGen-style byte pages.
+        """Reference-write mapped K/V tokens into one layer's byte pages.
 
         This helper is intentionally not called by the normal model forward
         path. It validates runner-owned block-table mapping and byte-page
-        layout before a future cache-write interception path is introduced.
+        layout before a future cache-read integration path is introduced.
         """
-        if self.cachegen_int8_page_adapter is None:
+        try:
+            adapter = self.get_cachegen_int8_page_adapter(layer_name=layer_name)
+        except ValueError as exc:
             raise RuntimeError(
                 "CacheGen-style byte-page adapter is not initialized"
-            )
+            ) from exc
+
         num_kv_cache_groups = len(self.input_batch.block_table.block_tables)
         if not 0 <= kv_cache_group_id < num_kv_cache_groups:
             raise ValueError(
@@ -3168,7 +3897,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         block_table = self.input_batch.block_table[kv_cache_group_id]
         write_cachegen_int8_mapped_tokens(
-            adapter=self.cachegen_int8_page_adapter,
+            adapter=adapter,
             keys=keys,
             values=values,
             quantized_page_ids=block_table.quantized_page_ids[:num_tokens],
@@ -3177,6 +3906,397 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ],
         )
 
+    def read_cachegen_int8_shadow_kv(
+        self,
+        *,
+        layer_name: str,
+        quantized_page_ids: torch.Tensor,
+        quantized_page_offsets: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference-read mapped K/V tokens from one layer's byte pages."""
+        if quantized_page_ids.ndim != 1:
+            raise ValueError("quantized_page_ids must be one-dimensional")
+        if quantized_page_offsets.shape != quantized_page_ids.shape:
+            raise ValueError(
+                "quantized_page_offsets must have the same shape as "
+                "quantized_page_ids"
+            )
+        if not dtype.is_floating_point:
+            raise ValueError("dtype must be floating point")
+
+        adapter = self.get_cachegen_int8_page_adapter(layer_name=layer_name)
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        for page_id, page_offset in zip(
+            quantized_page_ids.tolist(),
+            quantized_page_offsets.tolist(),
+        ):
+            key, value = adapter.read_token(
+                page_id=page_id,
+                page_offset=page_offset,
+                dtype=dtype,
+            )
+            keys.append(key)
+            values.append(value)
+
+        if not keys:
+            empty = torch.empty(
+                (0, adapter.layout.num_kv_heads, adapter.layout.head_size),
+                device=adapter.page_pool.device,
+                dtype=dtype,
+            )
+            return empty, empty.clone()
+
+        return torch.stack(keys), torch.stack(values)
+
+    def assign_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+        quantizer: str,
+    ) -> dict[str, str]:
+        """Assign an experimental paged-KV quantizer to one request."""
+        assignment = self.cachegen_kv_quantizer_assignments.assign(
+            request_id=request_id,
+            quantizer=quantizer,
+        )
+        return {
+            "request_id": assignment.request_id,
+            "quantizer": assignment.quantizer_id,
+        }
+
+    def remove_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+    ) -> dict[str, str] | None:
+        """Remove one request's experimental paged-KV quantizer assignment."""
+        assignment = self.cachegen_kv_quantizer_assignments.remove(request_id)
+        if assignment is None:
+            return None
+        return {
+            "request_id": assignment.request_id,
+            "quantizer": assignment.quantizer_id,
+        }
+
+    def get_cachegen_kv_quantizer(
+        self,
+        request_id: str,
+    ) -> str:
+        """Return one request's quantizer, defaulting safely to native."""
+        return self.cachegen_kv_quantizer_assignments.quantizer_for(
+            request_id
+        ).value
+
+    def snapshot_cachegen_kv_quantizers(self) -> dict[str, str]:
+        """Return all active request-to-quantizer assignments."""
+        return self.cachegen_kv_quantizer_assignments.snapshot()
+
+    def get_cachegen_kv_quantizer_assignment_stats(
+        self,
+    ) -> dict[str, object]:
+        """Return active per-request quantizer assignment counts."""
+        snapshot = self.cachegen_kv_quantizer_assignments.snapshot()
+        counts = {
+            quantizer.value: 0
+            for quantizer in CacheGenKVQuantizer
+        }
+        for quantizer in snapshot.values():
+            counts[quantizer] += 1
+
+        return {
+            "num_assignments": len(snapshot),
+            "assignments": snapshot,
+            "counts": counts,
+        }
+
+    def reset_cachegen_int8_decode_validation(self) -> None:
+        """Reset selected-layer compact INT8 validation pages in place.
+
+        This explicit diagnostic RPC is intentionally separate from native
+        vLLM request/block lifecycle. It is used to start an independent
+        experiment with empty compact pages and mappings.
+        """
+        selected_cache = self.cachegen_int8_selected_layer_cache
+        if selected_cache is None:
+            return
+
+        selected_cache.reset()
+        stats = self.cachegen_int8_decode_validation_stats
+        stats["reset_calls"] = int(stats.setdefault("reset_calls", 0)) + 1
+
+    def get_cachegen_int8_decode_validation_stats(
+        self,
+    ) -> dict[str, object] | None:
+        """Return selected-layer dynamic INT8 fused-decode validation stats."""
+        if not is_cachegen_int8_attention_enabled():
+            return None
+
+        stats = dict(self.cachegen_int8_decode_validation_stats)
+        stats.setdefault("route_fallback_reasons", {})
+        stats.setdefault("native_output_calls", 0)
+        stats.setdefault("int8_output_calls", 0)
+        stats.setdefault("common_page_int8_output_calls", 0)
+        stats.setdefault("reset_calls", 0)
+        stats.setdefault("common_page_fused_calls", 0)
+        stats.setdefault("common_page_missing_mirror_fallbacks", 0)
+        stats.setdefault("common_page_max_abs_error_vs_typed", 0.0)
+        stats.setdefault("common_page_mean_abs_error_vs_typed_sum", 0.0)
+        stats.setdefault("common_page_mean_abs_error_vs_typed_count", 0)
+        stats["layer_name"] = self.cachegen_int8_resolved_attention_layer
+        count = int(stats.pop("mean_abs_error_count"))
+        total = float(stats.pop("mean_abs_error_sum"))
+        stats["mean_abs_error"] = total / count if count else 0.0
+
+        common_count = int(
+            stats.pop("common_page_mean_abs_error_vs_typed_count", 0)
+        )
+        common_total = float(
+            stats.pop("common_page_mean_abs_error_vs_typed_sum", 0.0)
+        )
+        stats["common_page_mean_abs_error_vs_typed"] = (
+            common_total / common_count if common_count else 0.0
+        )
+
+        selected_cache = self.cachegen_int8_selected_layer_cache
+        if selected_cache is not None:
+            stats["mapped_pages"] = selected_cache.page_map.num_mapped_pages
+            stats["remaining_pages"] = selected_cache.page_map.remaining_pages
+            stats["int8_page_store_bytes"] = (
+                selected_cache.page_store.persistent_nbytes
+            )
+        return stats
+
+    def get_cachegen_int8_calibration_stats(
+        self,
+    ) -> dict[str, object] | None:
+        """Return selected-layer K/V calibration ranges from live attention."""
+        layer_name = get_cachegen_int8_calibration_layer()
+        if layer_name is None:
+            return None
+
+        attention_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            Attention,
+        )
+        try:
+            attention_layer = attention_layers[layer_name]
+        except KeyError as exc:
+            raise ValueError(
+                "No Attention module found for CacheGen INT8 calibration "
+                f"layer {layer_name!r}"
+            ) from exc
+
+        stats = getattr(
+            attention_layer,
+            "_cachegen_int8_calibration_stats",
+            None,
+        )
+        if stats is None:
+            return {
+                "layer_name": layer_name,
+                "callback_calls": 0,
+                "tokens_seen": 0,
+                "key_abs_max_per_head": [],
+                "value_abs_max_per_head": [],
+            }
+
+        return {
+            "layer_name": layer_name,
+            "callback_calls": int(stats["callback_calls"]),
+            "tokens_seen": int(stats["tokens_seen"]),
+            "key_abs_max_per_head": (
+                stats["key_abs_max_per_head"].float().cpu().tolist()
+            ),
+            "value_abs_max_per_head": (
+                stats["value_abs_max_per_head"].float().cpu().tolist()
+            ),
+        }
+
+    def get_cachegen_int8_decode_route_debug_state(
+        self,
+    ) -> dict[str, object]:
+        """Return read-only metadata needed to validate decode-route inputs."""
+        metadata_by_layer = getattr(
+            self,
+            "_last_cachegen_int8_attn_metadata",
+            {},
+        )
+        return dict(metadata_by_layer)
+
+    def get_cachegen_int8_layer_page_audit(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """Read one mapped token from each configured layer-local byte pool.
+
+        This eager diagnostic is intentionally bounded to one token per layer.
+        It is not part of the attention read path and must not be used as a
+        batched decode implementation.
+        """
+        layer_adapters = getattr(self, "cachegen_int8_page_adapters", {})
+        if not layer_adapters:
+            return {}
+
+        block_table = self.input_batch.block_table[0]
+        page_ids = block_table.quantized_page_ids
+        page_offsets = block_table.quantized_page_offsets
+        if page_ids.numel() == 0 or page_offsets.numel() == 0:
+            return {}
+
+        first_adapter = next(iter(layer_adapters.values()))
+        valid_indices = torch.nonzero(
+            (page_ids >= 0) & (page_ids < first_adapter.num_pages),
+            as_tuple=False,
+        )
+        if valid_indices.numel() == 0:
+            return {}
+
+        index = int(valid_indices[0].item())
+        page_id = int(page_ids[index].item())
+        page_offset = int(page_offsets[index].item())
+        audit: dict[str, dict[str, float | int]] = {}
+        for layer_name, adapter in layer_adapters.items():
+            key, value = adapter.read_token(
+                page_id=page_id,
+                page_offset=page_offset,
+                dtype=torch.float32,
+            )
+            audit[layer_name] = {
+                "page_id": page_id,
+                "page_offset": page_offset,
+                "key_abs_max": float(key.abs().amax().item()),
+                "value_abs_max": float(value.abs().amax().item()),
+            }
+        return audit
+
+    def _resolve_cachegen_int8_attention_layer(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> str:
+        """Resolve a user selector to one live decoder AttentionSpec layer.
+
+        Accepted selectors:
+        - ``auto``: first compatible registered decoder attention layer.
+        - ``last``: last compatible registered decoder attention layer.
+        - Non-negative integer: ordinal among compatible decoder layers.
+        - Exact vLLM cache-layer name.
+        - An unambiguous architecture-path prefix, such as
+          ``model.layers.0.self_attn`` for a registered
+          ``model.layers.0.self_attn.attn`` leaf.
+        """
+        selector = get_cachegen_int8_attention_layer()
+        if selector is None:
+            selector = "auto"
+
+        compatible_layers = [
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+            for layer_name in group.layer_names
+        ]
+        if not compatible_layers:
+            raise ValueError(
+                "CacheGen INT8 attention validation found no decoder "
+                "AttentionSpec layers in the live KV-cache configuration."
+            )
+
+        if selector == "auto":
+            resolved_layer = compatible_layers[0]
+        elif selector == "last":
+            resolved_layer = compatible_layers[-1]
+        elif selector.isdecimal():
+            layer_index = int(selector)
+            if layer_index >= len(compatible_layers):
+                raise ValueError(
+                    "CacheGen INT8 attention layer index is out of range: "
+                    f"selector={selector!r}, compatible_layer_count="
+                    f"{len(compatible_layers)}"
+                )
+            resolved_layer = compatible_layers[layer_index]
+        elif selector in compatible_layers:
+            resolved_layer = selector
+        else:
+            prefix_matches = [
+                layer_name
+                for layer_name in compatible_layers
+                if layer_name.startswith(selector + ".")
+            ]
+            if len(prefix_matches) == 1:
+                resolved_layer = prefix_matches[0]
+            elif len(prefix_matches) > 1:
+                raise ValueError(
+                    "CacheGen INT8 attention selector is ambiguous: "
+                    f"selector={selector!r}, matches={prefix_matches}"
+                )
+            else:
+                raise ValueError(
+                    "CacheGen INT8 attention selector did not match a live "
+                    "decoder cache layer: "
+                    f"selector={selector!r}, "
+                    f"compatible_layers={compatible_layers}"
+                )
+
+        logger.info(
+            "CacheGen INT8 resolved attention selector %r to live layer %r",
+            selector,
+            resolved_layer,
+        )
+        return resolved_layer
+
+    def _initialize_cachegen_int8_selected_layer_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Allocate dynamic INT8 validation pages for one selected layer."""
+        self.cachegen_int8_selected_layer_cache = None
+        self.cachegen_int8_decode_validation_stats = {
+            "callback_calls": 0,
+            "route_eligible_calls": 0,
+            "route_capacity_fallbacks": 0,
+            "route_unsupported_fallbacks": 0,
+            "route_fallback_reasons": {},
+            "native_output_calls": 0,
+            "int8_output_calls": 0,
+            "common_page_int8_output_calls": 0,
+            "max_abs_error": 0.0,
+            "mean_abs_error_sum": 0.0,
+            "mean_abs_error_count": 0,
+            "tokens_written": 0,
+        }
+
+        if not is_cachegen_int8_attention_enabled():
+            return
+
+        layer_name = self._resolve_cachegen_int8_attention_layer(
+            kv_cache_config
+        )
+        self.cachegen_int8_resolved_attention_layer = layer_name
+        max_pages = get_cachegen_int8_attention_max_pages()
+        assert max_pages is not None
+
+        decoder_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+            and layer_name in group.layer_names
+        ]
+        if len(decoder_specs) != 1:
+            raise ValueError(
+                "Selected CacheGen INT8 attention layer must belong to exactly "
+                f"one decoder AttentionSpec; got {layer_name!r}"
+            )
+
+        spec = decoder_specs[0]
+        self.cachegen_int8_selected_layer_cache = (
+            CacheGenInt8DynamicSelectedLayerCache.allocate(
+                max_pages=max_pages,
+                tokens_per_page=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                device=self.device,
+            )
+        )
+
+
     def _initialize_cachegen_int8_page_adapter(
         self,
         kv_cache_config: KVCacheConfig,
@@ -3184,11 +4304,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """Optionally bind CacheGen-style layout to experimental byte pages."""
         if not is_cachegen_int8_page_adapter_enabled():
             self.cachegen_int8_page_adapter = None
+            self.cachegen_int8_page_adapters = {}
+            self.cachegen_int8_shadow_layer_counters = {}
+            self.cachegen_int8_shadow_callback_calls = None
+            self.cachegen_int8_shadow_tokens_written = None
+            self.cachegen_int8_shadow_sample = None
             return
 
         if self.hetero_kv_page_pool is None:
             raise AssertionError(
                 "CacheGen-style page adapter requires byte-page storage"
+            )
+        if (
+            is_cachegen_int8_shadow_all_layers_enabled()
+            and getattr(self, "cachegen_int8_layer_page_pool", None) is None
+        ):
+            raise AssertionError(
+                "CacheGen-style all-layer shadow write requires layer-isolated "
+                "byte-page storage"
             )
 
         decoder_specs = [
@@ -3213,26 +4346,161 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
         num_kv_heads, head_size = geometries.pop()
-        self.cachegen_int8_page_adapter = CacheGenInt8FixedBytePageAdapter(
-            page_pool=self.hetero_kv_page_pool,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
+        self.cachegen_int8_page_adapters = {}
+        layer_page_pool = getattr(
+            self,
+            "cachegen_int8_layer_page_pool",
+            None,
         )
+        if layer_page_pool is not None:
+            for layer_name in layer_page_pool.layer_names:
+                self.cachegen_int8_page_adapters[layer_name] = (
+                    CacheGenInt8FixedBytePageAdapter(
+                        page_pool=layer_page_pool.layer_page_pool(layer_name),
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                    )
+                )
+            self.cachegen_int8_page_adapter = None
+        else:
+            self.cachegen_int8_page_adapter = CacheGenInt8FixedBytePageAdapter(
+                page_pool=self.hetero_kv_page_pool,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+            )
+
+        self.cachegen_int8_shadow_layer_counters = {}
+        if is_cachegen_int8_shadow_diagnostics_enabled():
+            diagnostics_device = self.hetero_kv_page_pool.device
+            self.cachegen_int8_shadow_callback_calls = torch.zeros(
+                (), dtype=torch.int64, device=diagnostics_device
+            )
+            self.cachegen_int8_shadow_tokens_written = torch.zeros(
+                (), dtype=torch.int64, device=diagnostics_device
+            )
+            for layer_name in self.cachegen_int8_page_adapters:
+                self.cachegen_int8_shadow_layer_counters[layer_name] = (
+                    torch.zeros((), dtype=torch.int64, device=diagnostics_device),
+                    torch.zeros((), dtype=torch.int64, device=diagnostics_device),
+                )
+        else:
+            self.cachegen_int8_shadow_callback_calls = None
+            self.cachegen_int8_shadow_tokens_written = None
+        self.cachegen_int8_shadow_sample = None
+
+    def get_cachegen_int8_shadow_diagnostics(
+        self,
+    ) -> dict[str, float | int] | None:
+        """Return explicitly enabled CacheGen shadow-write counters."""
+        callback_calls = getattr(
+            self,
+            "cachegen_int8_shadow_callback_calls",
+            None,
+        )
+        if callback_calls is None:
+            return None
+
+        tokens_written = getattr(
+            self,
+            "cachegen_int8_shadow_tokens_written",
+            None,
+        )
+        assert tokens_written is not None
+        diagnostics: dict[str, float | int] = {
+            "callback_calls": int(callback_calls.item()),
+            "tokens_written": int(tokens_written.item()),
+        }
+        shadow_sample = getattr(
+            self,
+            "cachegen_int8_shadow_sample",
+            None,
+        )
+        if shadow_sample is not None:
+            diagnostics["sample_count"] = 1
+            diagnostics.update(shadow_sample)
+        else:
+            diagnostics["sample_count"] = 0
+
+        layer_counters = getattr(
+            self,
+            "cachegen_int8_shadow_layer_counters",
+            {},
+        )
+        if layer_counters:
+            diagnostics["layers_with_writes"] = sum(
+                int(callback_calls.item() > 0)
+                for callback_calls, _ in layer_counters.values()
+            )
+            diagnostics["layer_counters"] = {
+                layer_name: {
+                    "callback_calls": int(callback_calls.item()),
+                    "tokens_written": int(tokens_written.item()),
+                }
+                for layer_name, (
+                    callback_calls,
+                    tokens_written,
+                ) in layer_counters.items()
+            }
+        return diagnostics
+
+    @staticmethod
+    def _get_cachegen_int8_decoder_layer_names(
+        kv_cache_config: KVCacheConfig,
+    ) -> list[str]:
+        """Return unique decoder-attention layer names in cache-group order."""
+        layer_names: list[str] = []
+        for group in kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                continue
+            layer_names.extend(group.layer_names)
+
+        if len(set(layer_names)) != len(layer_names):
+            raise ValueError(
+                "CacheGen-style layer page pools require unique decoder "
+                "attention layer names."
+            )
+        return layer_names
 
     def _initialize_hetero_kv_page_pool(self) -> None:
-        """Optionally allocate experimental common fixed-byte GPU pages.
+        """Optionally allocate experimental fixed-byte GPU pages.
 
-        Allocation is intentionally separate from standard VLLM KV cache
-        tensors. This establishes physical GPU storage for the experimental
-        heterogeneous path without changing baseline allocation or attention.
+        Storage remains separate from standard V1 KV-cache tensors. In
+        selected-layer mode this is one common pool. In all-layer shadow mode,
+        the same flat allocation is split into disjoint contiguous slices, one
+        for each decoder attention layer.
         """
+        self.cachegen_int8_layer_page_pool = None
+        self.cachegen_int8_pages_per_layer = None
         if not is_hetero_kv_page_pool_enabled():
             self.hetero_kv_page_pool = None
             return
 
+        pages_per_layer = get_hetero_kv_page_pool_pages()
+        page_bytes = get_hetero_kv_page_bytes()
+        if (
+            is_cachegen_int8_shadow_all_layers_enabled()
+            and hasattr(self, "kv_cache_config")
+        ):
+            layer_names = self._get_cachegen_int8_decoder_layer_names(
+                self.kv_cache_config
+            )
+            self.cachegen_int8_layer_page_pool = (
+                CacheGenInt8LayerPagePool.allocate(
+                    layer_names=layer_names,
+                    pages_per_layer=pages_per_layer,
+                    page_bytes=page_bytes,
+                    device=self.device,
+                )
+            )
+            self.hetero_kv_page_pool = (
+                self.cachegen_int8_layer_page_pool.page_pool
+            )
+            self.cachegen_int8_pages_per_layer = pages_per_layer
+            return
+
         self.hetero_kv_page_pool = self.allocate_fixed_byte_kv_page_pool(
-            num_pages=get_hetero_kv_page_pool_pages(),
-            page_bytes=get_hetero_kv_page_bytes(),
+            num_pages=pages_per_layer,
+            page_bytes=page_bytes,
             device=self.device,
         )
 
@@ -3479,6 +4747,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
         self._configure_hetero_kv_page_planning(kv_cache_config)
+        self._initialize_cachegen_int8_selected_layer_cache(kv_cache_config)
         self._initialize_hetero_kv_page_pool()
         self._initialize_cachegen_int8_page_adapter(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)

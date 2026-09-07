@@ -19,6 +19,9 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.utils import is_list_of
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.worker.experimental.hetero_kv_request_config import (
+    get_hetero_kv_default_quantizer_id,
+)
 from vllm.v1.engine.mm_input_cache import MultiModalInputCacheClient
 from vllm.v1.structured_output.backend_guidance import (
     validate_guidance_grammar)
@@ -345,6 +348,7 @@ class Processor:
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,
+            quantizer_id=get_hetero_kv_default_quantizer_id(),
         )
 
     def _validate_model_inputs(self,

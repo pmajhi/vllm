@@ -1,0 +1,9 @@
+torch_version=2.7.1+cu128
+torch_cuda_version=12.8
+cuda_available=True
+cuda_device_count=1
+device_0_name=NVIDIA A100-SXM4-40GB
+device_0_capability=(8, 0)
+device_0_total_memory_bytes=42404806656
+device_0_multiprocessors=108
+float8_e4m3fn_available=True

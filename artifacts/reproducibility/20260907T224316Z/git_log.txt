@@ -1,0 +1,20 @@
+d8c50a2112 (HEAD -> hetero-quant-paged-kv) Shadow CacheGen-style KV writes from FlashAttention
+a4e40293da Write CacheGen-style pages from token mapping
+2101d3b674 Bind CacheGen-style adapter to heterogeneous KV pages
+e30c84ff7f Add CacheGen-style int8 fixed-byte page adapter
+d3f77b9eef Allocate experimental heterogeneous KV byte-page pool
+be7670d1b0 Add heterogeneous KV page fragmentation simulator
+9574a4eca9 Add shared fixed-byte heterogeneous KV page pool
+737f6534fb Configure heterogeneous KV page planning in GPU runner
+eb4b7456ee Plan heterogeneous KV pages from model geometry
+d35a10f2bd (origin/hetero-quant-paged-kv) Add configurable heterogeneous KV page size
+cca990a3f0 Plan heterogeneous KV codec batches
+e07acc6f44 Add heterogeneous KV codec planning registry
+df6bce569c Add CacheGen-style int8 page geometry
+eabc201975 Add TurboQuant fixed-byte page geometry
+b18bead9a3 Add configurable KIVI fixed-byte page geometry
+74c8f46fef Add uniform int8 fixed-byte page data path
+2322221f69 Add fixed-byte uniform int8 KV page foundation
+c436e73955 Test heterogeneous quantized KV page mapping
+f55693b84f (origin/quantized-fixed-byte-pages, quantized-fixed-byte-pages) Prepare experimental KV codecs for asymmetric metadata
+d51e57e71a Generalize experimental KV cache codec storage

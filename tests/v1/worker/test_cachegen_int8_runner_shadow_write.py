@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 PAGE_BYTES = 128 * 1024
 NUM_KV_HEADS = 8
 HEAD_SIZE = 128
+LAYER_NAME = "model.decoder.layers.0.self_attn.attn"
 
 
 def make_runner() -> GPUModelRunner:
@@ -69,6 +70,7 @@ def test_runner_shadow_write_uses_block_table_mapping() -> None:
     values = torch.randn_like(keys)
 
     runner.write_cachegen_int8_shadow_kv(
+        layer_name=LAYER_NAME,
         kv_cache_group_id=0,
         keys=keys,
         values=values,
@@ -99,6 +101,7 @@ def test_runner_shadow_write_requires_initialized_adapter() -> None:
 
     with pytest.raises(RuntimeError, match="not initialized"):
         runner.write_cachegen_int8_shadow_kv(
+            layer_name=LAYER_NAME,
             kv_cache_group_id=0,
             keys=keys,
             values=keys,
@@ -111,6 +114,7 @@ def test_runner_shadow_write_rejects_invalid_group_id() -> None:
 
     with pytest.raises(ValueError, match="kv_cache_group_id must be"):
         runner.write_cachegen_int8_shadow_kv(
+            layer_name=LAYER_NAME,
             kv_cache_group_id=1,
             keys=keys,
             values=keys,
@@ -124,6 +128,7 @@ def test_runner_shadow_write_rejects_value_shape_mismatch() -> None:
 
     with pytest.raises(ValueError, match="values must have shape"):
         runner.write_cachegen_int8_shadow_kv(
+            layer_name=LAYER_NAME,
             kv_cache_group_id=0,
             keys=keys,
             values=values,
