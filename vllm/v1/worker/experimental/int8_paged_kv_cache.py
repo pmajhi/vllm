@@ -3,10 +3,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.worker.experimental.int8_kv import (
-    dequantize_symmetric_int8,
-    quantize_symmetric_int8,
-)
+from vllm.v1.quantized_kv_codec import QuantizedKVCodec
+from vllm.v1.worker.experimental.uniform_int8_codec import UniformInt8KVCodec
 
 class Int8PagedKVCache:
     """Reference INT8 paged KV cache addressed by page ID and page offset.
@@ -22,6 +20,7 @@ class Int8PagedKVCache:
         num_kv_heads: int,
         head_size: int,
         device: torch.device,
+        codec: QuantizedKVCodec | None = None,
     ) -> None:
         if num_physical_pages <= 0:
             raise ValueError("num_physical_pages must be positive")
@@ -36,6 +35,7 @@ class Int8PagedKVCache:
         self.tokens_per_page = tokens_per_page
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
+        self.codec = codec if codec is not None else UniformInt8KVCodec()
 
         kv_shape = (
             num_physical_pages,
@@ -50,15 +50,36 @@ class Int8PagedKVCache:
             1,
         )
 
-        self.keys = torch.zeros(kv_shape, dtype=torch.int8, device=device)
-        self.values = torch.zeros(kv_shape, dtype=torch.int8, device=device)
-        self.key_scales = torch.ones(
-            scale_shape,
+        payload_shape = (
+            num_physical_pages,
+            tokens_per_page,
+            num_kv_heads,
+            head_size,
+        )
+        metadata_shape = (
+            num_physical_pages,
+            tokens_per_page,
+            num_kv_heads,
+            *self.codec.metadata_shape,
+        )
+
+        self.keys = torch.empty(
+            payload_shape,
+            dtype=self.codec.storage_dtype,
+            device=device,
+        )
+        self.values = torch.empty(
+            payload_shape,
+            dtype=self.codec.storage_dtype,
+            device=device,
+        )
+        self.key_scales = torch.empty(
+            metadata_shape,
             dtype=torch.float32,
             device=device,
         )
-        self.value_scales = torch.ones(
-            scale_shape,
+        self.value_scales = torch.empty(
+            metadata_shape,
             dtype=torch.float32,
             device=device,
         )
@@ -84,8 +105,9 @@ class Int8PagedKVCache:
                 f"got {tuple(value.shape)}"
             )
 
-        quantized_key, key_scale = quantize_symmetric_int8(key)
-        quantized_value, value_scale = quantize_symmetric_int8(value)
+        quantized_key, quantized_value, key_scale, value_scale = (
+            self.codec.encode(key, value)
+        )
 
         self.keys[physical_page_id, page_offset] = quantized_key
         self.values[physical_page_id, page_offset] = quantized_value
@@ -133,8 +155,9 @@ class Int8PagedKVCache:
         offsets = page_offsets.to(torch.long)
         self._validate_batch_addresses(page_ids, offsets)
 
-        quantized_keys, key_scales = quantize_symmetric_int8(keys)
-        quantized_values, value_scales = quantize_symmetric_int8(values)
+        quantized_keys, quantized_values, key_scales, value_scales = (
+            self.codec.encode(keys, values)
+        )
 
         self.keys[page_ids, offsets] = quantized_keys
         self.values[page_ids, offsets] = quantized_values
@@ -150,17 +173,15 @@ class Int8PagedKVCache:
         self._validate_page_id(physical_page_id)
         self._validate_page_offset(page_offset)
 
-        key = dequantize_symmetric_int8(
-            self.keys[physical_page_id, page_offset],
-            self.key_scales[physical_page_id, page_offset],
+        return self.codec.decode(
+            (
+                self.keys[physical_page_id, page_offset],
+                self.values[physical_page_id, page_offset],
+                self.key_scales[physical_page_id, page_offset],
+                self.value_scales[physical_page_id, page_offset],
+            ),
             dtype,
         )
-        value = dequantize_symmetric_int8(
-            self.values[physical_page_id, page_offset],
-            self.value_scales[physical_page_id, page_offset],
-            dtype,
-        )
-        return key, value
 
     def read_batch(
         self,
@@ -184,16 +205,26 @@ class Int8PagedKVCache:
         offsets = page_offsets.to(torch.long)
         self._validate_batch_addresses(page_ids, offsets)
 
-        keys = dequantize_symmetric_int8(
-            self.keys[page_ids, offsets],
-            self.key_scales[page_ids, offsets],
-            dtype,
-        )
-        values = dequantize_symmetric_int8(
-            self.values[page_ids, offsets],
-            self.value_scales[page_ids, offsets],
-            dtype,
-        )
+        quantized_keys = self.keys[page_ids, offsets]
+        quantized_values = self.values[page_ids, offsets]
+        key_scales = self.key_scales[page_ids, offsets]
+        value_scales = self.value_scales[page_ids, offsets]
+
+        decoded = [
+            self.codec.decode(
+                (
+                    quantized_keys[token_index],
+                    quantized_values[token_index],
+                    key_scales[token_index],
+                    value_scales[token_index],
+                ),
+                dtype,
+            )
+            for token_index in range(page_ids.numel())
+        ]
+
+        keys, values = zip(*decoded)
+        return torch.stack(keys), torch.stack(values)
         return keys, values
 
     def _validate_batch_addresses(

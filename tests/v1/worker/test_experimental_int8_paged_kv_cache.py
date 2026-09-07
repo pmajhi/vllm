@@ -1,8 +1,9 @@
+from unittest.mock import Mock
 import pytest
 import torch
 
 from vllm.v1.worker.experimental.int8_paged_kv_cache import Int8PagedKVCache
-
+from unittest.mock import Mock
 
 def test_int8_paged_kv_cache_writes_and_reads_multiple_pages() -> None:
     cache = Int8PagedKVCache(
@@ -289,3 +290,60 @@ def test_int8_paged_kv_cache_rejects_invalid_batch_addresses(
 
     with pytest.raises(IndexError, match=error_message):
         cache.write_batch(page_ids, page_offsets, keys, values)
+
+def test_int8_paged_kv_cache_uses_injected_codec() -> None:
+    encoded_key = torch.tensor([[1, 2, 3, 4]], dtype=torch.int8)
+    encoded_value = torch.tensor([[5, 6, 7, 8]], dtype=torch.int8)
+    key_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    value_scale = torch.tensor([[0.5]], dtype=torch.float32)
+
+    codec = Mock()
+    codec.storage_dtype = torch.int8
+    codec.metadata_shape = (1,)
+    codec.encode.return_value = (
+        encoded_key,
+        encoded_value,
+        key_scale,
+        value_scale,
+    )
+
+    cache = Int8PagedKVCache(
+        num_physical_pages=1,
+        tokens_per_page=1,
+        num_kv_heads=1,
+        head_size=4,
+        device=torch.device("cpu"),
+        codec=codec,
+    )
+
+    key = torch.ones((1, 4), dtype=torch.float32)
+    value = torch.full((1, 4), 2.0, dtype=torch.float32)
+
+    cache.write(physical_page_id=0, page_offset=0, key=key, value=value)
+
+    codec.encode.assert_called_once_with(key, value)
+    torch.testing.assert_close(cache.keys[0, 0], encoded_key)
+    torch.testing.assert_close(cache.values[0, 0], encoded_value)
+    torch.testing.assert_close(cache.key_scales[0, 0], key_scale)
+    torch.testing.assert_close(cache.value_scales[0, 0], value_scale)
+
+def test_int8_paged_kv_cache_uses_codec_storage_description() -> None:
+    codec = Mock()
+    codec.storage_dtype = torch.uint8
+    codec.metadata_shape = (2,)
+
+    cache = Int8PagedKVCache(
+        num_physical_pages=3,
+        tokens_per_page=4,
+        num_kv_heads=2,
+        head_size=8,
+        device=torch.device("cpu"),
+        codec=codec,
+    )
+
+    assert cache.keys.dtype is torch.uint8
+    assert cache.values.dtype is torch.uint8
+    assert cache.keys.shape == (3, 4, 2, 8)
+    assert cache.values.shape == (3, 4, 2, 8)
+    assert cache.key_scales.shape == (3, 4, 2, 2)
+    assert cache.value_scales.shape == (3, 4, 2, 2)
