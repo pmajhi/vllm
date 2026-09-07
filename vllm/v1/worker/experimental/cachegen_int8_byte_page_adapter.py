@@ -323,3 +323,72 @@ class CacheGenInt8FixedBytePageAdapter:
                 f"{name} must be on {self.page_pool.device}, "
                 f"got {tensor.device}"
             )
+
+
+def write_cachegen_int8_mapped_tokens(
+    *,
+    adapter: CacheGenInt8FixedBytePageAdapter,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    quantized_page_ids: torch.Tensor,
+    quantized_page_offsets: torch.Tensor,
+) -> None:
+    """Reference-write scheduled K/V tokens using VLLM page mapping metadata.
+
+    The mapping tensors contain one physical page ID and codec-local page
+    offset per scheduled token. This intentionally uses a Python loop as a
+    correctness reference before a fused GPU write kernel replaces it.
+    """
+    expected_token_shape = (
+        adapter.layout.num_kv_heads,
+        adapter.layout.head_size,
+    )
+    if keys.ndim != 3 or tuple(keys.shape[1:]) != expected_token_shape:
+        raise ValueError(
+            "keys must have shape "
+            f"[num_tokens, {expected_token_shape[0]}, "
+            f"{expected_token_shape[1]}], got {tuple(keys.shape)}"
+        )
+    if values.shape != keys.shape:
+        raise ValueError(
+            f"values must have shape {tuple(keys.shape)}, "
+            f"got {tuple(values.shape)}"
+        )
+    if keys.device != adapter.page_pool.device:
+        raise ValueError(
+            f"keys must be on {adapter.page_pool.device}, got {keys.device}"
+        )
+    if values.device != adapter.page_pool.device:
+        raise ValueError(
+            f"values must be on {adapter.page_pool.device}, got {values.device}"
+        )
+    if not keys.dtype.is_floating_point:
+        raise ValueError("keys must have floating-point dtype")
+    if not values.dtype.is_floating_point:
+        raise ValueError("values must have floating-point dtype")
+
+    num_tokens = keys.shape[0]
+    for name, mapping in (
+        ("quantized_page_ids", quantized_page_ids),
+        ("quantized_page_offsets", quantized_page_offsets),
+    ):
+        if mapping.ndim != 1 or mapping.shape[0] != num_tokens:
+            raise ValueError(
+                f"{name} must have shape [{num_tokens}], "
+                f"got {tuple(mapping.shape)}"
+            )
+        if mapping.device != adapter.page_pool.device:
+            raise ValueError(
+                f"{name} must be on {adapter.page_pool.device}, "
+                f"got {mapping.device}"
+            )
+        if mapping.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must have integer dtype")
+
+    for token_index in range(num_tokens):
+        adapter.write_token(
+            page_id=int(quantized_page_ids[token_index]),
+            page_offset=int(quantized_page_offsets[token_index]),
+            key=keys[token_index],
+            value=values[token_index],
+        )

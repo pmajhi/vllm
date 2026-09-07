@@ -221,3 +221,98 @@ def test_rejects_non_uint8_pool() -> None:
             num_kv_heads=NUM_KV_HEADS,
             head_size=HEAD_SIZE,
         )
+
+
+def test_mapped_token_writer_round_trips_block_table_style_mapping() -> None:
+    from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
+        write_cachegen_int8_mapped_tokens,
+    )
+
+    torch.manual_seed(2)
+    adapter = make_adapter()
+    keys = torch.randn((4, NUM_KV_HEADS, HEAD_SIZE), dtype=torch.float32)
+    values = torch.randn_like(keys)
+
+    page_ids = torch.tensor([1, 1, 0, 2], dtype=torch.int32)
+    page_offsets = torch.tensor(
+        [0, adapter.tokens_per_page - 1, 3, 1],
+        dtype=torch.int32,
+    )
+
+    write_cachegen_int8_mapped_tokens(
+        adapter=adapter,
+        keys=keys,
+        values=values,
+        quantized_page_ids=page_ids,
+        quantized_page_offsets=page_offsets,
+    )
+
+    for index in range(keys.shape[0]):
+        decoded_key, decoded_value = adapter.read_token(
+            page_id=int(page_ids[index]),
+            page_offset=int(page_offsets[index]),
+        )
+        assert torch.allclose(
+            decoded_key,
+            keys[index],
+            atol=0.04,
+            rtol=0.02,
+        )
+        assert torch.allclose(
+            decoded_value,
+            values[index],
+            atol=0.04,
+            rtol=0.02,
+        )
+
+
+def test_mapped_token_writer_rejects_invalid_mapping_shapes() -> None:
+    from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
+        write_cachegen_int8_mapped_tokens,
+    )
+
+    adapter = make_adapter()
+    keys = torch.zeros((2, NUM_KV_HEADS, HEAD_SIZE), dtype=torch.float32)
+    values = torch.zeros_like(keys)
+
+    with pytest.raises(ValueError, match="quantized_page_ids must have shape"):
+        write_cachegen_int8_mapped_tokens(
+            adapter=adapter,
+            keys=keys,
+            values=values,
+            quantized_page_ids=torch.tensor([0], dtype=torch.int32),
+            quantized_page_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="quantized_page_offsets must have integer dtype",
+    ):
+        write_cachegen_int8_mapped_tokens(
+            adapter=adapter,
+            keys=keys,
+            values=values,
+            quantized_page_ids=torch.tensor([0, 1], dtype=torch.int32),
+            quantized_page_offsets=torch.tensor([0.0, 1.0]),
+        )
+
+
+def test_mapped_token_writer_rejects_incompatible_kv_shape() -> None:
+    from vllm.v1.worker.experimental.cachegen_int8_byte_page_adapter import (
+        write_cachegen_int8_mapped_tokens,
+    )
+
+    adapter = make_adapter()
+    keys = torch.zeros((2, NUM_KV_HEADS, HEAD_SIZE - 1), dtype=torch.float32)
+    values = torch.zeros_like(keys)
+    page_ids = torch.tensor([0, 1], dtype=torch.int32)
+    page_offsets = torch.tensor([0, 1], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="keys must have shape"):
+        write_cachegen_int8_mapped_tokens(
+            adapter=adapter,
+            keys=keys,
+            values=values,
+            quantized_page_ids=page_ids,
+            quantized_page_offsets=page_offsets,
+        )
